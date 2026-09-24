@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -80,6 +80,11 @@ header{
 .rdate{text-align:right;color:var(--dim);font-size:12.5px;white-space:nowrap}
 .rdate b{display:block;color:var(--txt);font-size:13.5px;font-weight:600}
 .badge{display:inline-block;background:var(--gold);color:#000;border-radius:5px;padding:1px 6px;font-size:10.5px;font-weight:800;margin-left:6px}
+/* 赛程行里的分阶段时间（排位 / 冲刺 / 正赛）。时间统一显示为北京时间 */
+.rsess{margin-top:5px;display:flex;flex-direction:column;gap:1px}
+.rsess span{display:flex;gap:8px;font-size:11.5px;color:var(--dim);line-height:1.5}
+.rsess i{font-style:normal;color:var(--dim2);font-weight:600;min-width:46px;flex:none}
+.sess-h .muted{font-weight:400;font-size:12px;margin-left:auto}
 
 /* ---------- results table ---------- */
 .tw{overflow-x:auto}
@@ -164,6 +169,8 @@ footer{text-align:center;color:var(--dim2);font-size:11.5px;margin-top:30px;line
   .rname{font-size:13.5px}
   .rname .en{display:none}
   .rmeta{font-size:11.5px}
+  .rsess span{font-size:11px}
+  .rsess i{min-width:42px}
   .rdate{grid-column:2;text-align:left;margin-top:3px;font-size:11.5px}
   .rdate b{display:inline;margin-right:6px}
 
@@ -469,7 +476,11 @@ async function loadAll(onProgress, onScheduleReady){
 
   S.races = real.map((m, i) => {
     const list = byMeeting[m.meeting_key] || [];
-    const keyOf = nm => (list.find(s => s.session_name === nm) || {}).session_key || null;
+    const find = nm => list.find(s => s.session_name === nm) || null;
+    const q  = find("Qualifying");
+    const sp = find("Sprint");
+    const sq = find("Sprint Qualifying");
+    const rc = find("Race");
     return {
       round: i + 1,
       meeting_key: m.meeting_key,
@@ -478,19 +489,34 @@ async function loadAll(onProgress, onScheduleReady){
       location: m.location,
       country: m.country_name,
       flag: m.country_flag,
-      date: (m.date_start || "").slice(0, 10),
-      dateEnd: (m.date_end || "").slice(0, 10),
+      weekendStart: (m.date_start || "").slice(0, 10),
       circuit: m.circuit_short_name,
+      /* 正赛日（北京时区）。
+         以前这里用的是 meeting.date_start —— 那是周末第一天（周五），
+         不是正赛日，所以赛程上显示的日期一直是错的。 */
+      date: bjDate(rc && rc.date_start) || (m.date_start || "").slice(0, 10),
+      /* 各阶段真实开赛时间（UTC ISO）。显示时用 fmtSession 转北京时间。 */
+      times: {
+        sprintq: sq ? sq.date_start : null,
+        sprint:  sp ? sp.date_start : null,
+        quali:   q  ? q.date_start : null,
+        race:    rc ? rc.date_start : null
+      },
+      raceStart: rc ? rc.date_start : m.date_start,
+      raceEnd:   rc ? rc.date_end   : m.date_end,
       sessions: {
-        quali:  keyOf("Qualifying"),
-        sprint: keyOf("Sprint"),
-        race:   keyOf("Race")
+        quali:  q  ? q.session_key : null,
+        sprint: sp ? sp.session_key : null,
+        race:   rc ? rc.session_key : null
       }
     };
   });
 
   const now = Date.now();
-  const past = S.races.filter(r => new Date(r.date + "T23:59:59Z").getTime() < now);
+  /* 「已完赛」以正赛结束时间为准。
+     以前用分站开始日（周五）的 23:59 去比 —— 周六就认为周日的比赛已结束，
+     会去拉还没产生的成绩，然后误报「上游数据源尚未同步」。 */
+  const past = S.races.filter(r => r.raceEnd && new Date(r.raceEnd).getTime() < now);
   // 赛程已就绪 → 先让界面把它渲染出来，用户不用干等后面的数据
   if(onScheduleReady) onScheduleReady();
 
@@ -646,19 +672,62 @@ function teamCell(meetingKey, num){
 /* =========================================================
    渲染：赛程
    ========================================================= */
+const WEEK_CN = ["周日","周一","周二","周三","周四","周五","周六"];
+
+/* OpenF1 给的时间全是 UTC（形如 2026-03-29T05:00:00+00:00）。
+   中国用户要看北京时间 = 固定 UTC+8（中国不用夏令时）。
+   注意不能直接截字符串取日期：美洲那些凌晨 UTC 的比赛，
+   按 UTC 截出来的日期和北京时间差一天。所以走 Date 换算。 */
+const BJ_OFFSET = 8 * 3600 * 1000;
+function bjParts(iso){
+  if(!iso) return null;
+  const d = new Date(iso);
+  if(isNaN(d.getTime())) return null;
+  const t = new Date(d.getTime() + BJ_OFFSET);   // 加 8 小时后按 UTC 字段读
+  return {
+    y: t.getUTCFullYear(), m: t.getUTCMonth() + 1, d: t.getUTCDate(),
+    hh: String(t.getUTCHours()).padStart(2, "0"),
+    mm: String(t.getUTCMinutes()).padStart(2, "0"),
+    dow: t.getUTCDay()
+  };
+}
+/* ISO(UTC) -> "YYYY-MM-DD"（北京时区），给 fmtDate 用 */
+function bjDate(iso){
+  const p = bjParts(iso);
+  return p ? `${p.y}-${String(p.m).padStart(2, "0")}-${String(p.d).padStart(2, "0")}` : null;
+}
+/* ISO(UTC) -> "3月29日 周日 13:00"（北京时区） */
+function fmtSession(iso){
+  const p = bjParts(iso);
+  return p ? `${p.m}月${p.d}日 ${WEEK_CN[p.dow]} ${p.hh}:${p.mm}` : "—";
+}
+/* "YYYY-MM-DD" -> "3月29日 周日" */
 function fmtDate(d){
   if(!d) return "—";
   const dt = new Date(d + "T12:00:00");
   if(isNaN(dt)) return d;
-  const w = ["周日","周一","周二","周三","周四","周五","周六"][dt.getDay()];
-  return `${dt.getMonth() + 1}月${dt.getDate()}日 ${w}`;
+  return `${dt.getMonth() + 1}月${dt.getDate()}日 ${WEEK_CN[dt.getDay()]}`;
 }
 function nextRound(){
   const now = Date.now();
   for(const r of S.races){
-    if(new Date(r.date + "T23:59:59Z").getTime() > now) return r.round;
+    if(r.raceEnd && new Date(r.raceEnd).getTime() > now) return r.round;
   }
   return null;
+}
+
+/* 赛程行里列出各阶段的北京时间。
+   冲刺周末的顺序是：冲刺排位(五) → 冲刺赛(六) → 排位赛(六) → 正赛(日)。 */
+function sessionLines(r){
+  const t = r.times || {};
+  const rows = [];
+  if(t.sprintq) rows.push(["冲刺排位", t.sprintq]);
+  if(t.sprint)  rows.push(["冲刺赛",   t.sprint]);
+  if(t.quali)   rows.push(["排位赛",   t.quali]);
+  if(t.race)    rows.push(["正赛",     t.race]);
+  if(!rows.length) return "";
+  return '<div class="rsess">' + rows.map(([k, v]) =>
+    '<span><i>' + esc(k) + '</i>' + esc(fmtSession(v)) + '</span>').join("") + '</div>';
 }
 function flagImg(race){
   if(!race?.flag) return "";
@@ -681,8 +750,9 @@ function renderSeason(){
           ${r.sessions.sprint ? '<span class="badge">冲刺</span>' : ""}
           ${isNext ? '<span class="badge" style="background:#3d9dff;color:#fff">下一站</span>' : ""}</div>
         <div class="rmeta">${esc(r.circuit || "")} · ${esc(r.location || "")}</div>
+        ${sessionLines(r)}
       </div>
-      <div class="rdate"><b>${esc(fmtDate(r.date))}</b>${hasRes ? "已完赛" : "未开赛"}</div>
+      <div class="rdate"><b>${esc(fmtDate(r.date))}</b>正赛日 · ${hasRes ? "已完赛" : "未开赛"}</div>
     </div>`;
   }).join("");
 
@@ -694,7 +764,7 @@ function renderSeason(){
   const note = $("#dataNote");
   if(note){
     const missing = S.races.filter(r =>
-      new Date(r.date + "T23:59:59Z").getTime() < Date.now() && !S.results[r.round]);
+      r.raceEnd && new Date(r.raceEnd).getTime() < Date.now() && !S.results[r.round]);
     if(missing.length){
       const list = missing.map(r => `第${esc(r.round)}站 ${esc(raceCN(r))}`).join("、");
       note.innerHTML = `<div class="card"><div class="msg" style="color:var(--gold)">
@@ -858,19 +928,23 @@ function showRound(round){
     <div class="card" style="margin-bottom:20px">
       <div class="card-h" style="font-size:16px">
         ${flagImg(r)} 第 ${esc(r.round)} 站 · ${esc(raceCN(r))}
-        <span class="muted">${esc(r.name)} · ${esc(r.circuit || "")} · ${esc(fmtDate(r.date))}</span>
+        <span class="muted">${esc(r.name)} · ${esc(r.circuit || "")}</span>
       </div>
+      <div style="padding:10px 18px 12px">${sessionLines(r)}</div>
     </div>
     <div class="sess">
-      <div class="sess-h"><span class="ln"></span>排位赛 Qualifying</div>
+      <div class="sess-h"><span class="ln"></span>排位赛 Qualifying
+        <span class="muted">${esc(fmtSession(r.times.quali))}</span></div>
       ${sessionTable(S.quali[round], "quali", mk)}
     </div>
     ${S.sprint[round] ? `<div class="sess">
-      <div class="sess-h"><span class="ln" style="background:var(--gold)"></span>冲刺赛 Sprint</div>
+      <div class="sess-h"><span class="ln" style="background:var(--gold)"></span>冲刺赛 Sprint
+        <span class="muted">${esc(fmtSession(r.times.sprint))}</span></div>
       ${sessionTable(S.sprint[round], "sprint", mk)}
     </div>` : ""}
     <div class="sess">
-      <div class="sess-h"><span class="ln" style="background:var(--green)"></span>正赛 Grand Prix</div>
+      <div class="sess-h"><span class="ln" style="background:var(--green)"></span>正赛 Grand Prix
+        <span class="muted">${esc(fmtSession(r.times.race))}</span></div>
       ${sessionTable(S.results[round], "race", mk)}
     </div>`;
 
