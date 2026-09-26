@@ -408,6 +408,126 @@ function of1(path, retries = 2){
 }
 
 /* =========================================================
+   Jolpica 备用源
+   ---------------------------------------------------------
+   为什么需要：OpenF1 在 F1 比赛进行期间会锁掉整个 API，返回 401
+   {"detail":"Live F1 session in progress. Global API access (including
+    past sessions) is restricted to authenticated users until the session
+    ends."} —— 而那正好是用户最想查成绩的时候。Jolpica 没这个限制。
+
+   Jolpica 是 Ergast 的续作，返回的是 Ergast 那套 MRData 结构。
+   代价：没有车手照片、没有车队配色、赛后同步比 OpenF1 慢一些。
+   所以它只在 OpenF1 失败时启用，平时完全不参与。
+   ========================================================= */
+const JOL = "https://api.jolpi.ca/ergast/f1";
+
+function jolGet(path, retries = 2){
+  const url = JOL + path;
+  const hit = _cache.get(url);
+  if(hit && Date.now() - hit.t < CACHE_TTL) return hit.p;
+  const p = (async () => {
+    for(let i = 0; i <= retries; i++){
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), REQ_TIMEOUT);
+      try{
+        const r = await fetch(url, { signal: ctrl.signal });
+        clearTimeout(timer);
+        if(r.status === 429 || r.status >= 500){
+          if(i < retries){ await new Promise(x => setTimeout(x, 1200 * (i + 1))); continue; }
+          throw new Error("Jolpica 限流（HTTP " + r.status + "）");
+        }
+        if(!r.ok) throw new Error("HTTP " + r.status);
+        return await r.json();
+      }catch(e){
+        clearTimeout(timer);
+        if(i >= retries){ _cache.delete(url); throw e; }
+        await new Promise(x => setTimeout(x, 1200 * (i + 1)));
+      }
+    }
+  })();
+  _cache.set(url, { t: Date.now(), p });
+  return p;
+}
+
+/* Jolpica 分页有坑：limit 上限 100，而 offset 是按「返回行数」算的，
+   不是按场次。所以想拿整季必须翻页，不能按 round 切。
+   每页把 (race, row) 拆平存下来，后面按 round 归类。 */
+async function jolPaged(path, key, maxPages = 16){
+  const out = [];
+  let total = Infinity;
+  for(let page = 0; page < maxPages; page++){
+    const sep = path.includes("?") ? "&" : "?";
+    const j = await jolGet(`${path}${sep}limit=100&offset=${page * 100}`);
+    const MR = j && j.MRData;
+    if(!MR) break;
+    total = parseInt(MR.total || "0", 10) || 0;
+    const races = (MR.RaceTable && MR.RaceTable.Races) || [];
+    let got = 0;
+    for(const race of races){
+      const list = race[key];
+      if(!Array.isArray(list)) continue;
+      for(const row of list){ out.push({ race, row }); got++; }
+    }
+    if(got === 0 || out.length >= total) break;
+  }
+  return out;
+}
+
+/* Jolpica 不提供车队配色，按 2026 赛季手工维护一份。
+   键是 Ergast 的 constructorId（同一支车队的历史 id 都列上，兼容旧数据）。 */
+const TEAM_COLOUR = {
+  mercedes:"00d2be", ferrari:"e8002d", mclaren:"ff8000", red_bull:"3671c6",
+  rb:"6692ff", racing_bulls:"6692ff", alphatauri:"6692ff", toro_rosso:"6692ff",
+  alpine:"ff87bc", renault:"ffd800", audi:"00e701", sauber:"52e252", kick_sauber:"52e252",
+  williams:"64c4ff", aston_martin:"229971", haas:"b6babd", cadillac:"c8a951"
+};
+const teamColour = id => "#" + (TEAM_COLOUR[id] || "888888");
+
+/* Ergast 的车队名和 OpenF1 不一样，补一张对照表 */
+const TEAM_CN_ERGAST = {
+  "Mercedes":"梅赛德斯", "Ferrari":"法拉利", "McLaren":"迈凯伦",
+  "Red Bull":"红牛", "RB":"红牛二队", "Racing Bulls":"红牛二队",
+  "Alpine F1 Team":"阿尔派", "Alpine":"阿尔派",
+  "Audi":"奥迪", "Kick Sauber":"索伯", "Sauber":"索伯",
+  "Williams":"威廉姆斯", "Aston Martin":"阿斯顿马丁",
+  "Haas F1 Team":"哈斯", "Haas":"哈斯", "Cadillac":"凯迪拉克"
+};
+const teamCNErgast = t => TEAM_CN_ERGAST[t] || t || "";
+
+/* "1:32:45.123" / "1:23.456" / "45.123" -> 秒 */
+function timeToSec(s){
+  if(!s || typeof s !== "string") return null;
+  const p = s.trim().split(":").map(Number);
+  if(!p.length || p.some(isNaN)) return null;
+  if(p.length === 3) return p[0] * 3600 + p[1] * 60 + p[2];
+  if(p.length === 2) return p[0] * 60 + p[1];
+  return p[0];
+}
+
+/* Ergast 的完赛状态 -> 本 App 的 dnf / dsq / dns 标记 */
+function ergastStatus(row){
+  const t = (row.positionText || "").toUpperCase();
+  const st = (row.status || "").toLowerCase();
+  if(t === "D" || st.includes("disqualif")) return { dsq: 1 };
+  if(t === "E" || st.includes("excluded"))  return { dsq: 1 };
+  if(t === "W" || st.includes("withdraw"))  return { dns: 1 };
+  if(t === "F" || st.includes("failed to qualify")) return { dns: 1 };
+  if(t === "R" || t === "N" || st === "accident" || st.includes("collision") ||
+     st.includes("engine") || st.includes("gearbox") || st.includes("hydraulics") ||
+     st.includes("electrical") || st.includes("spun off") || st.includes("retired") ||
+     st.includes("damage") || st.includes("brakes") || st.includes("overheating") ||
+     st.includes("mechanical") || st.includes("wheel") || st.includes("suspension") ||
+     st.includes("fuel") || st.includes("tyre") || st.includes("oil") ||
+     st.includes("water") || st.includes("puncture") || st.includes("illness") ||
+     st.includes("injury") || st.includes("power unit") || st.includes("driveshaft") ||
+     st.includes("clutch") || st.includes("vibration") || st.includes("ignition") ||
+     st.includes("exhaust") || st.includes("throttle") || st.includes("steering") ||
+     st.includes("technical") || st.includes("debris") || st.includes("seat") ||
+     st.includes("rear wing") || st.includes("front wing")) return { dnf: 1 };
+  return null;
+}
+
+/* =========================================================
    本地缓存
    ========================================================= */
 /* 持久化缓存说明：
@@ -422,6 +542,76 @@ try{
 }catch(e){}
 function saveStore(){
   try{ localStorage.setItem(LS_KEY, JSON.stringify(_store)); }catch(e){}
+}
+
+/* ---------- 结果快照 ----------
+   比 _store 更「成品」的一层：把组装好的成绩/积分榜存一份。
+   两个数据源都连不上时用它顶上，至少不是一片白屏。
+   注意体积：这是同步写 localStorage，之前 1.16MB 的写入把手机卡死过，
+   所以只存渲染要用的字段，不含原始 API 响应，也不含车手信息（那个走 _store.drivers）。 */
+const SNAP_TTL = 7 * 24 * 60 * 60 * 1000;
+
+function saveSnapshot(){
+  try{
+    localStorage.setItem(LS_KEY + "_snap", JSON.stringify({
+      at: Date.now(),
+      races: S.races,
+      results: S.results,
+      quali: S.quali,
+      sprint: S.sprint,
+      ds: S.ds,
+      cs: S.cs,
+      standingsRound: S.standingsRound,
+      standingsMeeting: S.standingsMeeting
+    }));
+  }catch(e){ /* 超配额就算了，不能影响主流程 */ }
+}
+
+function loadSnapshot(){
+  try{
+    const raw = localStorage.getItem(LS_KEY + "_snap");
+    if(!raw) return null;
+    const s = JSON.parse(raw);
+    if(!s || !Array.isArray(s.races) || !s.races.length) return null;
+    if(Date.now() - (s.at || 0) > SNAP_TTL) return null;
+    return s;
+  }catch(e){ return null; }
+}
+
+function applySnapshot(s){
+  S.races = s.races || [];
+  S.results = s.results || {};
+  S.quali   = s.quali   || {};
+  S.sprint  = s.sprint  || {};
+  S.ds = s.ds || [];
+  S.cs = s.cs || [];
+  S.standingsRound   = (s.standingsRound === undefined)   ? null : s.standingsRound;
+  S.standingsMeeting = (s.standingsMeeting === undefined) ? null : s.standingsMeeting;
+  S.cachedAt = s.at;
+  S.source = "cache";
+  S.failed = [];
+  /* 车手信息不在快照里（太大），从 _store.drivers 重建。
+     那份缓存 3 天有效，赛季内车手名单不变，够用。 */
+  const roster = {};
+  for(const d of (_store.drivers || [])){
+    if(roster[d.driver_number]) continue;
+    roster[d.driver_number] = {
+      number: d.driver_number,
+      name: d.full_name,
+      acronym: d.name_acronym,
+      team: d.team_name,
+      colour: "#" + (d.team_colour || "888888"),
+      photo: PHOTO_FIX[d.driver_number] || d.headshot_url || null,
+      country: d.country_code
+    };
+  }
+  S.drivers = {};
+  for(const r of S.races){
+    const bucket = {};
+    for(const num of Object.keys(roster)) bucket[num] = roster[num];
+    S.drivers[r.meeting_key] = bucket;   // 各分站共用同一对象，不复制
+  }
+  S.loaded = true;
 }
 
 /* =========================================================
@@ -610,8 +800,275 @@ async function loadAll(onProgress, onScheduleReady){
     S.standingsMeeting = lastPast.meeting_key;
   }
 
+  S.source = "openf1";
+  S.cachedAt = null;
+  saveSnapshot();
   S.loaded = true;
   return past.length;
+}
+
+/* =========================================================
+   备用源加载：Jolpica
+   ========================================================= */
+/* Jolpica 给的国家名 -> 国旗图。只在没有 OpenF1 缓存时才用到。 */
+const COUNTRY_CC = {
+  "Australia":"au","China":"cn","Japan":"jp","Bahrain":"bh","Saudi Arabia":"sa",
+  "USA":"us","United States":"us","Italy":"it","Monaco":"mc","Spain":"es",
+  "Canada":"ca","Austria":"at","UK":"gb","United Kingdom":"gb","Great Britain":"gb",
+  "Hungary":"hu","Belgium":"be","Netherlands":"nl","Azerbaijan":"az","Singapore":"sg",
+  "Mexico":"mx","Brazil":"br","Qatar":"qa","UAE":"ae","United Arab Emirates":"ae",
+  "Malaysia":"my","Portugal":"pt","Turkey":"tr","France":"fr","Germany":"de",
+  "Korea":"kr","South Korea":"kr","India":"in","South Africa":"za","Switzerland":"ch"
+};
+function flagUrl(country){
+  const cc = COUNTRY_CC[country];
+  return cc ? "https://flagcdn.com/w40/" + cc + ".png" : null;
+}
+
+/* 车手照片 / 车队色：优先用 OpenF1 之前缓存下来的（3 天内有效），
+   这样切到备用源时头像和配色不会突然消失。 */
+function cachedDriver(num){
+  const list = _store.drivers;
+  if(!Array.isArray(list)) return null;
+  return list.find(x => x.driver_number === num) || null;
+}
+function bestPhoto(num){
+  if(PHOTO_FIX[num]) return PHOTO_FIX[num];
+  const d = cachedDriver(num);
+  return (d && d.headshot_url) || null;
+}
+function bestColour(num, fallback){
+  const d = cachedDriver(num);
+  if(d && d.team_colour) return "#" + d.team_colour;
+  return fallback;
+}
+
+/* Jolpica 不给排位/冲刺的开赛时间。
+   如果本地还留着 OpenF1 的 meetings/sessions 缓存（3 天），
+   按「分站日期区间」匹配，把时间补回来。匹配不上就留空 ——
+   sessionLines() 会自动跳过没有时间的阶段，不会显示 "—"。 */
+function mergeSessionTimes(races){
+  const ms = _store.meetings, ss = _store.sessions;
+  if(!Array.isArray(ms) || !Array.isArray(ss)) return 0;
+  const byMeeting = {};
+  for(const s of ss) (byMeeting[s.meeting_key] = byMeeting[s.meeting_key] || []).push(s);
+  let n = 0;
+  for(const r of races){
+    const rd = new Date(r.date + "T12:00:00Z").getTime();
+    const m = ms.find(x => {
+      if(x.is_cancelled) return false;
+      const a = new Date(x.date_start).getTime() - 36 * 3600 * 1000;
+      const b = new Date(x.date_end).getTime()   + 36 * 3600 * 1000;
+      return rd >= a && rd <= b;
+    });
+    if(!m) continue;
+    const list = byMeeting[m.meeting_key] || [];
+    const find = nm => (list.find(s => s.session_name === nm) || {}).date_start || null;
+    r.times.race    = r.times.race    || find("Race");
+    r.times.quali   = r.times.quali   || find("Qualifying");
+    r.times.sprint  = r.times.sprint  || find("Sprint");
+    r.times.sprintq = r.times.sprintq || find("Sprint Qualifying");
+    if(!r.flag && m.country_flag) r.flag = m.country_flag;
+    n++;
+  }
+  return n;
+}
+
+async function loadFromJolpica(onProgress){
+  const P = (d, t, label) => { if(onProgress) onProgress(d, t, label); };
+
+  /* ---- 1. 赛程 ---- */
+  P(1, 3, "备用源：获取赛程");
+  const sch  = await jolGet(`/${YEAR}/races.json?limit=100`);
+  const jRaces = (sch.MRData && sch.MRData.RaceTable && sch.MRData.RaceTable.Races) || [];
+  if(!jRaces.length) throw new Error("Jolpica 没返回赛程");
+
+  /* Ergast 的 races.json 里带了各阶段的日期和时间（Qualifying / Sprint），
+     所以备用源也能显示排位和冲刺的开赛时间，不只是正赛。
+     唯一缺的是「冲刺排位」（Ergast 没这个字段），由 mergeSessionTimes 从
+     OpenF1 缓存补；补不到就不显示（sessionLines 会自动跳过该行）。
+
+     date 必须按北京时区算：Jolpica 的 r.date 是当地日期，
+     美洲站在北京时间会跨天，直接用它会和下面的开赛时间自相矛盾。 */
+  const joinIso = (d, t) => (d ? (t ? `${d}T${t}` : `${d}T12:00:00Z`) : null);
+
+  S.races = jRaces.map((r, i) => {
+    const round = parseInt(r.round, 10) || (i + 1);
+    const loc   = (r.Circuit && r.Circuit.Location) || {};
+    const raceIso   = joinIso(r.date, r.time);
+    const qualiIso  = r.Qualifying ? joinIso(r.Qualifying.date, r.Qualifying.time) : null;
+    const sprintIso = r.Sprint     ? joinIso(r.Sprint.date,     r.Sprint.time)     : null;
+    const start = new Date(raceIso);
+    const end   = new Date(start.getTime() + 2 * 3600 * 1000);
+    return {
+      round,
+      meeting_key: round,          // Jolpica 没有 meeting_key，用轮次代替
+      name: r.raceName,
+      official: r.raceName,
+      location: loc.locality || "",
+      country: loc.country || "",
+      flag: flagUrl(loc.country),
+      date: bjDate(raceIso) || r.date,
+      circuit: (r.Circuit && r.Circuit.circuitName) || "",
+      times: { sprintq: null, sprint: sprintIso, quali: qualiIso, race: raceIso },
+      raceStart: raceIso,
+      raceEnd: isNaN(end) ? null : end.toISOString(),
+      /* sprint 只在该站真有冲刺赛时才有值。
+         之前一律填轮次号，结果每一站都被标上「冲刺」徽章。 */
+      sessions: { quali: round, sprint: r.Sprint ? round : null, race: round }
+    };
+  });
+
+  mergeSessionTimes(S.races);
+  if(onProgress) onProgress(1, 3, "备用源：获取赛程");
+
+  /* ---- 2. 成绩（整季翻页拉）---- */
+  P(2, 3, "备用源：获取成绩");
+  const [raceRows, qualiRows, sprintRows] = await Promise.all([
+    jolPaged(`/${YEAR}/results.json`,    "Results"),
+    jolPaged(`/${YEAR}/qualifying.json`, "QualifyingResults"),
+    jolPaged(`/${YEAR}/sprint.json`,     "SprintResults")
+  ]);
+
+  /* ---- 3. 积分榜 ---- */
+  P(3, 3, "备用源：获取积分榜");
+  const [dsJ, csJ] = await Promise.all([
+    jolGet(`/${YEAR}/driverStandings.json`).catch(() => null),
+    jolGet(`/${YEAR}/constructorStandings.json`).catch(() => null)
+  ]);
+
+  /* ---- 车手名单（从成绩里抽，一个赛季的名单是稳定的）---- */
+  const roster = {};
+  const absorb = (drv, con, numRaw) => {
+    const num = parseInt(numRaw, 10);
+    if(!num || roster[num]) return;
+    const name = ((drv.givenName || "") + " " + (drv.familyName || "")).trim();
+    roster[num] = {
+      number: num,
+      name,
+      acronym: drv.code || (drv.familyName || "???").slice(0, 3).toUpperCase(),
+      team: con ? con.name : "",
+      colour: bestColour(num, con ? teamColour(con.constructorId) : "#888888"),
+      photo: bestPhoto(num),
+      country: drv.nationality || null
+    };
+  };
+  for(const { row } of raceRows)  absorb(row.Driver || {}, row.Constructor, row.number);
+  for(const { row } of sprintRows) absorb(row.Driver || {}, row.Constructor, row.number);
+  for(const { row } of qualiRows) absorb(row.Driver || {}, row.Constructor, row.number);
+
+  S.drivers = {};
+  for(const r of S.races){
+    const bucket = {};
+    for(const num of Object.keys(roster)) bucket[num] = roster[num];
+    S.drivers[r.round] = bucket;       // 所有分站共用同一个对象，不复制
+  }
+
+  /* ---- 结果归类 ---- */
+  const orderPos = (a, b) => (a.position ?? 999) - (b.position ?? 999);
+
+  S.results = {}; S.quali = {}; S.sprint = {}; S.failed = [];
+
+  // 正赛 / 冲刺赛
+  const buildRaceRow = (row, leaderMs) => {
+    const out = {
+      driver_number: parseInt(row.number, 10),
+      position: parseInt(row.position, 10) || null,
+      points: parseFloat(row.points) || 0,
+      number_of_laps: parseInt(row.laps, 10) || null
+    };
+    Object.assign(out, ergastStatus(row) || {});
+    const ms = row.Time && row.Time.millis ? parseInt(row.Time.millis, 10) : null;
+    if(out.position === 1 && row.Time && row.Time.time){
+      out.duration = timeToSec(row.Time.time);
+    } else if(ms && leaderMs){
+      out.gap_to_leader = (ms - leaderMs) / 1000;
+    } else if(row.status && /^\+\d+\s*Laps?$/i.test(row.status)){
+      out.gap_to_leader = row.status;      // 被套圈，交给 gapText 处理
+    }
+    return out;
+  };
+
+  {
+    const byRound = {};
+    for(const { race, row } of raceRows){
+      const rd = parseInt(race.round, 10);
+      (byRound[rd] = byRound[rd] || []).push(row);
+    }
+    for(const rd of Object.keys(byRound)){
+      const list = byRound[rd].slice().sort(orderPos);
+      const leader = list.find(x => parseInt(x.position, 10) === 1);
+      const leaderMs = leader && leader.Time && leader.Time.millis ? parseInt(leader.Time.millis, 10) : null;
+      S.results[rd] = list.map(row => buildRaceRow(row, leaderMs));
+    }
+  }
+  {
+    const byRound = {};
+    for(const { race, row } of sprintRows){
+      const rd = parseInt(race.round, 10);
+      (byRound[rd] = byRound[rd] || []).push(row);
+    }
+    for(const rd of Object.keys(byRound)){
+      const list = byRound[rd].slice().sort(orderPos);
+      const leader = list.find(x => parseInt(x.position, 10) === 1);
+      const leaderMs = leader && leader.Time && leader.Time.millis ? parseInt(leader.Time.millis, 10) : null;
+      S.sprint[rd] = list.map(row => buildRaceRow(row, leaderMs));
+    }
+  }
+  {
+    // 排位赛：Ergast 给 Q1/Q2/Q3 三段，取最快的一段作为成绩
+    const byRound = {};
+    for(const { race, row } of qualiRows){
+      const rd = parseInt(race.round, 10);
+      (byRound[rd] = byRound[rd] || []).push(row);
+    }
+    for(const rd of Object.keys(byRound)){
+      const list = byRound[rd].slice().sort(orderPos);
+      S.quali[rd] = list.map(row => {
+        const secs = [row.Q1, row.Q2, row.Q3].map(timeToSec).filter(x => x != null);
+        const best = secs.length ? Math.min(...secs) : null;
+        return {
+          driver_number: parseInt(row.number, 10),
+          position: parseInt(row.position, 10) || null,
+          duration: best != null ? [best] : []   // 单元素数组，sessionTable 取 .pop() 正好拿到
+        };
+      });
+    }
+  }
+
+  /* ---- 积分榜 ---- */
+  const sl = j => {
+    const t = j && j.MRData && j.MRData.StandingsTable;
+    return (t && t.StandingsLists && t.StandingsLists[0]) || null;
+  };
+  const dsList = sl(dsJ), csList = sl(csJ);
+
+  S.ds = ((dsList && dsList.DriverStandings) || []).map(x => {
+    const num = parseInt(x.Driver && x.Driver.permanentNumber, 10) || 0;
+    return {
+      driver_number: num,
+      position_current: parseInt(x.position, 10),
+      points_current: parseFloat(x.points) || 0
+    };
+  }).filter(x => x.driver_number);
+
+  S.cs = ((csList && csList.ConstructorStandings) || []).map(x => ({
+    team_name: (x.Constructor && x.Constructor.name) || "",
+    position_current: parseInt(x.position, 10),
+    points_current: parseFloat(x.points) || 0
+  }));
+
+  /* 积分榜对应的分站：最后一站有正赛成绩的 */
+  const doneRounds = Object.keys(S.results).map(Number).sort((a, b) => a - b);
+  const lastDone = doneRounds.length ? doneRounds[doneRounds.length - 1] : null;
+  S.standingsRound   = lastDone;
+  S.standingsMeeting = lastDone;
+
+  S.source = "jolpica";
+  S.cachedAt = null;
+  saveSnapshot();
+  S.loaded = true;
+  return doneRounds.length;
 }
 
 /* =========================================================
@@ -760,19 +1217,35 @@ function renderSeason(){
     el.onclick = () => { switchTab("results"); showRound(Number(el.dataset.round)); };
   });
 
-  // 未同步提示
+  // 数据源状态 + 未同步提示
   const note = $("#dataNote");
   if(note){
+    let html = "";
+
+    if(S.source === "jolpica"){
+      html += `<div class="card"><div class="msg" style="color:var(--blue)">
+        ℹ️ 主数据源 <b>OpenF1</b> 当前不可用 —— 它在 F1 比赛进行期间会锁掉整个接口。
+        已自动切到备用源 <b>Jolpica</b>，赛程 / 成绩 / 积分榜正常；车手照片和车队配色
+        取自上赛季缓存，可能有个别缺失。</div></div>`;
+    } else if(S.source === "cache"){
+      const t = S.cachedAt
+        ? new Date(S.cachedAt).toLocaleString("zh-CN", { hour12: false })
+        : "未知时间";
+      html += `<div class="card"><div class="msg" style="color:var(--gold)">
+        ⚠️ <b>当前显示的是本地缓存</b>（存于 ${esc(t)}），两个数据源都连不上。
+        数据不一定是最新的，网络恢复后点右上角「刷新数据」。</div></div>`;
+    }
+
     const missing = S.races.filter(r =>
       r.raceEnd && new Date(r.raceEnd).getTime() < Date.now() && !S.results[r.round]);
     if(missing.length){
       const list = missing.map(r => `第${esc(r.round)}站 ${esc(raceCN(r))}`).join("、");
-      note.innerHTML = `<div class="card"><div class="msg" style="color:var(--gold)">
-        ⏳ ${list} 的成绩 <b>上游数据源尚未同步</b>（OpenF1 通常在赛后几分钟到几小时内补齐）。</div></div>`;
-      note.classList.remove("hide");
-    } else {
-      note.classList.add("hide");
+      html += `<div class="card"><div class="msg" style="color:var(--gold)">
+        ⏳ ${list} 的成绩 <b>上游数据源尚未同步</b>（通常在赛后几分钟到几小时内补齐）。</div></div>`;
     }
+
+    if(html){ note.innerHTML = html; note.classList.remove("hide"); }
+    else note.classList.add("hide");
   }
 }
 
@@ -965,22 +1438,39 @@ function switchTab(name){
 document.querySelectorAll(".tab").forEach(t => { t.onclick = () => switchTab(t.dataset.tab); });
 
 async function boot(force){
-  if(force){ _cache.clear(); S.loaded = false; }
+  if(force){ _cache.clear(); S.loaded = false; S.source = null; }
   const bar = txt => {
     $("#raceList").innerHTML = `<div class="msg">${esc(txt)}</div>`;
     $("#resultsList").innerHTML = `<div class="msg">${esc(txt)}</div>`;
   };
+  const progress = (d, total, label) => {
+    $("#prog").textContent = `加载中 ${Math.round(d / total * 100)}%`;
+    bar(`正在${label || "获取数据"}…`);
+  };
+  // 赛程一拿到就先渲染出来，用户不用干等后面的数据
+  const onScheduleReady = () => { renderSeason(); renderResultsList(); };
+
   try{
     if(!S.loaded){
       bar("正在获取赛程…");
-      await loadAll(
-        (d, total, label) => {
-          $("#prog").textContent = `加载中 ${Math.round(d / total * 100)}%`;
-          bar(`正在${label || "获取数据"}…`);
-        },
-        // 赛程一拿到就先渲染出来，剩下的数据后台继续加载
-        () => { renderSeason(); renderResultsList(); }
-      );
+      try{
+        await loadAll(progress, onScheduleReady);
+      }catch(e1){
+        /* OpenF1 挂了。最常见的不是网络问题，而是比赛进行期间它把整个 API
+           锁掉（401 "Live F1 session in progress"）—— 而那正好是用户最想
+           查成绩的时候。所以不能直接报错，要换备用源。 */
+        console.warn("[F1助手] OpenF1 失败，切换备用源：", e1.message);
+        bar("主数据源不可用，正在切换备用源…");
+        try{
+          await loadFromJolpica(progress);
+        }catch(e2){
+          console.warn("[F1助手] Jolpica 也失败，退回本地缓存：", e2.message);
+          const snap = loadSnapshot();
+          if(!snap) throw e1;                 // 三个都没有，才真的没辙
+          applySnapshot(snap);
+          bar("两个数据源都连不上，正在显示本地缓存…");
+        }
+      }
     }
     bar("正在整理数据…");
     renderSeason();
@@ -990,7 +1480,8 @@ async function boot(force){
     if(ts) ts.textContent = "更新于 " + new Date().toLocaleTimeString("zh-CN", { hour12: false });
   }catch(e){
     const m = `<div class="msg err">数据加载失败：${esc(e.message)}<br><br>
-      接口有频率限制，请等 1 分钟后点「刷新数据」重试。</div>`;
+      OpenF1 在 F1 比赛进行期间会锁站（属正常现象），此时备用源也会被尝试；
+      若已过比赛时段，请等 1 分钟后点「刷新数据」重试。</div>`;
     $("#raceList").innerHTML = m;
     $("#resultsList").innerHTML = m;
     console.error(e);
