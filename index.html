@@ -9,6 +9,7 @@
   --bg:#0d0e12; --card:#16181f; --card2:#1c1f28; --line:#272b36;
   --txt:#e8eaf0; --dim:#8b93a7; --dim2:#5f6678;
   --red:#e10600; --gold:#ffd15c; --green:#00d17a; --blue:#3d9dff;
+  --av:54px;          /* 车手头像尺寸；手机端在下面的媒体查询里调小 */
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{
@@ -104,11 +105,11 @@ tbody tr:hover{background:#ffffff07}
 }
 .pos.p1{color:var(--gold)} .pos.p2{color:#cfd4e0} .pos.p3{color:#d08a52}
 .pos.pd{color:var(--dim2);font-size:13px}
-.dr{display:flex;align-items:center;gap:10px;min-width:190px}
-.dr img{width:38px;height:38px;border-radius:50%;object-fit:cover;object-position:top center;background:#22252e;flex:none}
+.dr{display:flex;align-items:center;gap:11px;min-width:210px}
+.dr img{width:var(--av);height:var(--av);border-radius:50%;object-fit:cover;object-position:top center;background:#22252e;flex:none}
 .av{
-  width:38px;height:38px;border-radius:50%;flex:none;display:flex;
-  align-items:center;justify-content:center;font-size:11.5px;font-weight:800;
+  width:var(--av);height:var(--av);border-radius:50%;flex:none;display:flex;
+  align-items:center;justify-content:center;font-size:15px;font-weight:800;
   color:#0d0e12;letter-spacing:.3px;
 }
 .dr .nm{font-weight:600;white-space:nowrap}
@@ -176,10 +177,11 @@ footer{text-align:center;color:var(--dim2);font-size:11.5px;margin-top:30px;line
 
   /* 表格：精准瘦身，不横向溢出 */
   th{padding:7px 6px;font-size:10px;letter-spacing:.2px}
-  td{padding:7px 6px;font-size:12.5px}
+  td{padding:6px 6px;font-size:12.5px}
   .pos{width:30px;font-size:13px}
-  .dr{min-width:0;gap:7px}
-  .dr img,.av{width:30px;height:30px;font-size:9.5px}
+  .dr{min-width:0;gap:8px}
+  :root{--av:44px}                    /* 手机端头像跟着调小，但仍比原来大 */
+  .av{font-size:12px}
   .dr .nm{font-size:12.5px;white-space:normal;line-height:1.25}
   .dr .cd{font-size:10px}
   .team{font-size:11px;padding-left:6px;border-left-width:2px;white-space:normal}
