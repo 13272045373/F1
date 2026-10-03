@@ -33,7 +33,40 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"      # 20 已被 GitHub 标记为 deprecated
+
+      # 先诊断一下 GitHub 的服务器到底能不能连上 F1 官方 CDN。
+      # 上一次"跑成功却没产出"，就是因为连不上、而脚本把错误吞掉了。
+      # 有了这一步，日志第一屏就能看出问题。
+      - name: 诊断：能不能连上官方源
+        run: |
+          echo "===== DNS ====="
+          getent hosts livetiming.formula1.com || echo "❌ DNS 解析失败"
+          echo ""
+          echo "===== 取年度索引 ====="
+          curl -sS -o /tmp/idx.json -w "HTTP %{http_code}  用时 %{time_total}s  大小 %{size_download} 字节\n" \
+            --max-time 40 "https://livetiming.formula1.com/static/2026/Index.json" \
+            || echo "❌ curl 失败（退出码 $?）"
+          echo ""
+          if [ -s /tmp/idx.json ]; then
+            echo "===== 内容开头 ====="
+            head -c 300 /tmp/idx.json; echo ""
+          fi
+
+      # 先自己检查一遍脚本在不在。
+      # 上一次失败就是因为文件名漏了 .mjs（仓库里叫 fetch-f1），
+      # 而 node 对没有后缀的文件会按 CommonJS 解析，import 语句直接报错。
+      # 与其让它报一句看不懂的错，不如在这里把目录列出来。
+      - name: 检查脚本
+        run: |
+          echo "当前目录内容："
+          ls -la
+          if [ ! -f fetch-f1.mjs ]; then
+            echo "::error title=找不到 fetch-f1.mjs::仓库根目录下没有 fetch-f1.mjs。请确认文件名带 .mjs 后缀（不能是 fetch-f1）。"
+            exit 1
+          fi
+          echo "✅ 找到 fetch-f1.mjs"
+          ls -l fetch-f1.mjs
 
       - name: 抓取官方数据
         env:
@@ -41,6 +74,15 @@ jobs:
           F1_OUT: "data/f1.json"
           F1_MAX_SESSIONS: "40"
         run: node fetch-f1.mjs
+
+      - name: 确认产出
+        run: |
+          if [ ! -f data/f1.json ]; then
+            echo "::error title=没有产出 data/f1.json::脚本跑完了但没生成文件，请看上一步的日志。"
+            exit 1
+          fi
+          echo "产出大小：$(du -h data/f1.json | cut -f1)"
+          node -e "const j=require('./data/f1.json');console.log('场次数:',j.count,' 更新时间:',j.updated);console.log('包含的 session key:',Object.keys(j.sessions).join(', '))"
 
       - name: 有变化就提交
         run: |
