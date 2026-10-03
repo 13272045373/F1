@@ -1,23 +1,22 @@
-# 每 10 分钟抓一次 F1 官方数据，存成静态 JSON 供前端读取
+# 每 10 分钟抓一次 F1 数据，存成静态 JSON 供前端读取
 #
-# 放在仓库的 .github/workflows/ 目录下。
-# 产出 data/f1.json，前端从 raw.githubusercontent.com 读（raw 有 CORS，官方源没有）。
+# 背景：
+#   F1 官方 live timing（livetiming.formula1.com）数据最全、无限流，
+#   但它【没有 CORS】（浏览器调不到），而且【会 403 拒绝云服务器 IP】
+#   —— 2026-10-03 实测：GitHub runner 请求它返回 HTTP 403。
+#   所以本 workflow 会先探测哪些源从 GitHub 服务器可达，再决定抓哪个。
 #
-# 注意：
-#   · 定时任务只在【默认分支】上生效
-#   · GitHub 的 schedule 实际会有几分钟延迟，属正常
-#   · 本 workflow 会自己 commit，仓库保持活跃，不会被自动停用
+# 产出：data/f1.json（给前端用）、data/probe.txt（数据源探测报告）
 
 name: F1 data relay
 
 on:
   schedule:
-    # GitHub 最短 5 分钟，但排队会延迟；10 分钟是更实际的间隔
     - cron: "*/10 * * * *"
-  workflow_dispatch:        # 也可以在 Actions 页面手动点一下跑
+  workflow_dispatch:
 
 permissions:
-  contents: write           # 需要写权限才能 commit
+  contents: write
 
 concurrency:
   group: f1-data
@@ -33,66 +32,77 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"      # 20 已被 GitHub 标记为 deprecated
+          node-version: "22"
 
-      # 先诊断一下 GitHub 的服务器到底能不能连上 F1 官方 CDN。
-      # 上一次"跑成功却没产出"，就是因为连不上、而脚本把错误吞掉了。
-      # 有了这一步，日志第一屏就能看出问题。
-      - name: 诊断：能不能连上官方源
+      # 探测各数据源从 GitHub 服务器能不能连上。
+      # 结果写进 data/probe.txt 并提交，这样不用看日志也能知道结论。
+      - name: 探测数据源可达性
         run: |
-          echo "===== DNS ====="
-          getent hosts livetiming.formula1.com || echo "❌ DNS 解析失败"
-          echo ""
-          echo "===== 取年度索引 ====="
-          curl -sS -o /tmp/idx.json -w "HTTP %{http_code}  用时 %{time_total}s  大小 %{size_download} 字节\n" \
-            --max-time 40 "https://livetiming.formula1.com/static/2026/Index.json" \
-            || echo "❌ curl 失败（退出码 $?）"
-          echo ""
-          if [ -s /tmp/idx.json ]; then
-            echo "===== 内容开头 ====="
-            head -c 300 /tmp/idx.json; echo ""
-          fi
+          mkdir -p data
+          {
+            echo "探测时间(UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "出口 IP      : $(curl -s --max-time 10 https://api.ipify.org || echo '取不到')"
+            echo ""
+            echo "===== 各数据源可达性 ====="
+            probe() {
+              printf '%-52s ' "$2"
+              curl -sS -o /tmp/p.out -w "HTTP %{http_code}  %{time_total}s  %{size_download} 字节\n" \
+                --max-time 25 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" "$1" 2>/dev/null \
+                || echo "curl 失败(退出码 $?)"
+            }
+            probe "https://livetiming.formula1.com/static/2026/Index.json" "官方 live timing（已测 403）"
+            probe "https://www.formula1.com/en/results/2026/races"          "F1 官网成绩页"
+            probe "https://www.formula1.com/en/racing/2026.html"            "F1 官网赛程页"
+            probe "https://api.openf1.org/v1/sessions?session_key=11730"    "OpenF1"
+            probe "https://api.jolpi.ca/ergast/f1/2026/races.json?limit=1"  "Jolpica"
+            probe "https://f1api.dev/api/2026"                              "f1api.dev"
+            probe "https://raw.githubusercontent.com/13272045373/F1/main/index.html" "GitHub raw（对照）"
+            echo ""
+            echo "===== F1 官网成绩页内容检查 ====="
+            curl -sS --max-time 25 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+              "https://www.formula1.com/en/results/2026/races" -o /tmp/f1.html 2>/dev/null || true
+            if [ -s /tmp/f1.html ]; then
+              echo "  抓到 $(wc -c < /tmp/f1.html) 字节"
+              for k in Sepang Malaysia Kuala Verstappen Hamilton Qualifying; do
+                printf '  关键词 %-12s 出现 ' "$k"
+                grep -o -i "$k" /tmp/f1.html 2>/dev/null | wc -l
+              done
+            else
+              echo "  没抓到内容"
+            fi
+          } > data/probe.txt 2>&1
+          cat data/probe.txt
 
-      # 先自己检查一遍脚本在不在。
-      # 上一次失败就是因为文件名漏了 .mjs（仓库里叫 fetch-f1），
-      # 而 node 对没有后缀的文件会按 CommonJS 解析，import 语句直接报错。
-      # 与其让它报一句看不懂的错，不如在这里把目录列出来。
       - name: 检查脚本
         run: |
           echo "当前目录内容："
           ls -la
           if [ ! -f fetch-f1.mjs ]; then
-            echo "::error title=找不到 fetch-f1.mjs::仓库根目录下没有 fetch-f1.mjs。请确认文件名带 .mjs 后缀（不能是 fetch-f1）。"
+            echo "::error title=找不到 fetch-f1.mjs::仓库根目录下没有 fetch-f1.mjs。请确认文件名带 .mjs 后缀。"
             exit 1
           fi
           echo "✅ 找到 fetch-f1.mjs"
-          ls -l fetch-f1.mjs
 
-      - name: 抓取官方数据
+      - name: 抓取数据
+        continue-on-error: true
         env:
           F1_YEAR: "2026"
           F1_OUT: "data/f1.json"
           F1_MAX_SESSIONS: "40"
         run: node fetch-f1.mjs
 
-      - name: 确认产出
-        run: |
-          if [ ! -f data/f1.json ]; then
-            echo "::error title=没有产出 data/f1.json::脚本跑完了但没生成文件，请看上一步的日志。"
-            exit 1
-          fi
-          echo "产出大小：$(du -h data/f1.json | cut -f1)"
-          node -e "const j=require('./data/f1.json');console.log('场次数:',j.count,' 更新时间:',j.updated);console.log('包含的 session key:',Object.keys(j.sessions).join(', '))"
-
-      - name: 有变化就提交
+      # 不管上面成没成功，都要把探测报告提交上去 —— 那是排查的依据
+      - name: 提交产出（无论成败）
+        if: always()
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain data/f1.json)" ]; then
-            git add data/f1.json
-            git commit -m "chore(f1): 更新官方数据 $(date -u +%Y-%m-%dT%H:%MZ)"
+          if [ -n "$(git status --porcelain data/)" ]; then
+            git add -A data/
+            git commit -m "chore(f1): 更新数据 $(date -u +%Y-%m-%dT%H:%MZ)"
             git push
-            echo "已提交"
+            echo "已提交："
+            git show --stat --oneline HEAD
           else
-            echo "数据无变化，跳过提交"
+            echo "data/ 无变化，跳过提交"
           fi
