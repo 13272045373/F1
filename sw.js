@@ -9,7 +9,7 @@
 //
 // 顺带的好处：静态文件会缓存，第二次打开几乎是瞬开；断网也能打开看已缓存的内容。
 
-const CACHE = "f1-assistant-v1";
+const CACHE = "f1-assistant-v3";
 
 // 只预缓存这几个小的、稳定的文件。
 // index.html 故意不放进来 —— 它每次改动都要能立刻看到，靠下面的"网络优先"来保证。
@@ -49,8 +49,18 @@ self.addEventListener("fetch", (e) => {
   }
 
   // 本站其它资源：网络优先（保证改了就能看到），失败再落缓存（保证断网也能开）
+  //
+  // ⚠️ HTML 请求要额外加 cache:"reload" 绕过浏览器自己的 HTTP 缓存。
+  //    GitHub Pages 给页面发的头是 Cache-Control: max-age=600 ——
+  //    光靠"网络优先"还不够，浏览器会先拿本地那份攒了 10 分钟的副本，
+  //    结果就是"改了之后手机上要等十分钟才看得到"。
+  //    加上 reload 之后每次导航都真的去问服务器，改完立刻生效。
+  const isHTML = req.mode === "navigate" ||
+                 (req.headers.get("accept") || "").indexOf("text/html") >= 0;
+  const init = isHTML ? { cache: "reload" } : undefined;
+
   e.respondWith(
-    fetch(req)
+    fetch(req, init)
       .then((res) => {
         if (res && res.status === 200 && res.type === "basic") {
           const copy = res.clone();
