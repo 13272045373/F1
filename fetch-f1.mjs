@@ -22,16 +22,24 @@ const WANT_TYPES = new Set(["Qualifying", "Sprint Qualifying"]);
 
 const UA = { "User-Agent": "Mozilla/5.0 (compatible; f1-data-relay/1.0)" };
 
-// 带重试和超时的 GET（官方 CDN 偶尔会连不上，实测过）
+// 带重试和超时的 GET。
+// 每次失败都要打印原因 —— 上一版把错误吞掉了，导致"跑成功但没产出"，
+// 日志里一句有用的话都没有，排查全靠猜。
 async function get(url, tries = 3) {
+  let lastErr = "未知错误";
   for (let i = 1; i <= tries; i++) {
     try {
       const r = await fetch(url, { headers: UA, signal: AbortSignal.timeout(25000) });
       if (r.status === 200) return await r.text();
-      if (r.status === 403 || r.status === 404) return null;   // 确实没有，别重试
+      lastErr = "HTTP " + r.status;
+      if (r.status === 403 || r.status === 404) {   // 确实没有，重试也没用
+        console.log(`  [${i}/${tries}] ${lastErr}  ${url}`);
+        return null;
+      }
     } catch (e) {
-      // 网络层失败，重试
+      lastErr = (e && e.cause ? (e.cause.code || e.cause.message) : e && e.message) || String(e);
     }
+    console.log(`  [${i}/${tries}] 失败: ${lastErr}  ${url}`);
     if (i < tries) await new Promise(x => setTimeout(x, 1500 * i));
   }
   return null;
@@ -57,8 +65,14 @@ console.log(`年份 ${YEAR}，输出 ${OUT_FILE}`);
 // ---------- 1) 年度索引 ----------
 const index = await json(`${BASE}${YEAR}/Index.json`);
 if (!index || !Array.isArray(index.Meetings)) {
-  console.error("拿不到年度索引，退出（保留上一次的数据文件）");
-  process.exit(0);   // 不要 fail 掉 workflow，避免把已有数据搞没
+  console.error("");
+  console.error("❌ 拿不到官方年度索引，本轮不产出。");
+  console.error("   地址  : " + BASE + YEAR + "/Index.json");
+  console.error("   说明  : 仓库里已有的 data/f1.json 不会被改动（本轮不提交任何东西）。");
+  console.error("   原因  : 看上面每次重试打印的错误 —— 最常见是官方 CDN 从这个网络不可达。");
+  console.error("");
+  process.exit(1);   // 必须明确失败。之前这里 exit(0)，
+                     // 结果 Actions 显示"成功"却什么都没做，白排查了半天。
 }
 
 // ---------- 2) 挑出要抓的 session：已结束的排位类 ----------
