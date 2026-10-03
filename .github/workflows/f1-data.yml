@@ -1,0 +1,56 @@
+# 每 10 分钟抓一次 F1 官方数据，存成静态 JSON 供前端读取
+#
+# 放在仓库的 .github/workflows/ 目录下。
+# 产出 data/f1.json，前端从 raw.githubusercontent.com 读（raw 有 CORS，官方源没有）。
+#
+# 注意：
+#   · 定时任务只在【默认分支】上生效
+#   · GitHub 的 schedule 实际会有几分钟延迟，属正常
+#   · 本 workflow 会自己 commit，仓库保持活跃，不会被自动停用
+
+name: F1 data relay
+
+on:
+  schedule:
+    # GitHub 最短 5 分钟，但排队会延迟；10 分钟是更实际的间隔
+    - cron: "*/10 * * * *"
+  workflow_dispatch:        # 也可以在 Actions 页面手动点一下跑
+
+permissions:
+  contents: write           # 需要写权限才能 commit
+
+concurrency:
+  group: f1-data
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: 抓取官方数据
+        env:
+          F1_YEAR: "2026"
+          F1_OUT: "data/f1.json"
+          F1_MAX_SESSIONS: "40"
+        run: node fetch-f1.mjs
+
+      - name: 有变化就提交
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain data/f1.json)" ]; then
+            git add data/f1.json
+            git commit -m "chore(f1): 更新官方数据 $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push
+            echo "已提交"
+          else
+            echo "数据无变化，跳过提交"
+          fi
