@@ -83,8 +83,7 @@ jobs:
           fi
           echo "✅ 找到 fetch-f1.mjs"
 
-      - name: 抓取数据
-        continue-on-error: true
+      - name: 抓取数据（预取 OpenF1）
         env:
           F1_YEAR: "2026"
           F1_OUT: "data/f1.json"
