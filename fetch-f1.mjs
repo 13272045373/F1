@@ -150,4 +150,13 @@ const body = JSON.stringify(out);
 fs.writeFileSync(OUT_FILE, body, "utf8");
 console.log(`  已写入 ${OUT_FILE}`);
 console.log(`  大小 ${(body.length / 1024).toFixed(0)} KB`);
+
+/* 再按年份归档一份：data/f1-2026.json
+   前端支持多赛季，优先读这个按年份命名的文件；
+   data/f1.json 继续写一份，是为了兼容早期版本的前端。 */
+const byYear = OUT_FILE.replace(/f1\.json$/, "f1-" + YEAR + ".json");
+if (byYear !== OUT_FILE) {
+  fs.writeFileSync(byYear, body, "utf8");
+  console.log(`  已写入 ${byYear}（按年份归档，前端优先读这个）`);
+}
 console.log(`  meetings ${meetings.length} / sessions ${sessions.length} / drivers ${drivers.length} / results ${results.length} / 积分榜 ${champDrivers.length}+${champTeams.length}`);
