@@ -1,38 +1,38 @@
-// GitHub Actions 定时抓取 F1 官方 live timing 数据 → 生成精简 JSON
+// GitHub Actions 定时预取 OpenF1 数据 → 打包成一个静态 JSON
 //
-// 为什么要这么绕：
-//   F1 官方 live timing（livetiming.formula1.com）数据最全、无限流，
-//   但它【没有 CORS】—— 浏览器里的静态页面（GitHub Pages）调不到。
-//   而 GitHub Actions 是服务端环境，没有 CORS 限制。
-//   所以：Actions 抓 → 存成仓库里的静态 JSON → 前端从 raw.githubusercontent.com 读（raw 有 CORS）。
+// 为什么这么做（而不是抓官方源）：
+//   2026-10-03 实测，GitHub runner 请求 F1 官方 live timing 返回 HTTP 403
+//   —— Akamai 屏蔽了云服务器 IP。F1 官网虽然能连（457KB），但页面是前端渲染的
+//   空壳，里面一个车手名都没有，扒它等于要逆向内部 API，太脆。
+//   而 OpenF1 从 GitHub 完全可达（实测 200），所以改成"预取 OpenF1"。
+//
+// 好处：
+//   1) 浏览器只读一个静态文件，秒开，不再打 6 个请求
+//   2) 限流只落在 Actions 这一个 IP 上，用户完全避开 429
+//   3) 每 10 分钟跑一次，数据最多滞后十几分钟
 //
 // 产出：data/f1.json
-//
-// 只抓「排位赛 / 冲刺排位」的成绩表（Position + BestLapTime 正好是页面要显示的）。
-// 正赛的官方数据没有积分字段、状态码还要另做映射，继续交给 OpenF1/Jolpica。
 
 import fs from "node:fs";
 import path from "node:path";
 
 const YEAR = Number(process.env.F1_YEAR || 2026);
-const BASE = "https://livetiming.formula1.com/static/";
+const OF1 = "https://api.openf1.org/v1";
 const OUT_FILE = process.env.F1_OUT || "data/f1.json";
-const MAX_SESSIONS = Number(process.env.F1_MAX_SESSIONS || 40);   // 最多保留多少场
-const WANT_TYPES = new Set(["Qualifying", "Sprint Qualifying"]);
+const UA = { "User-Agent": "Mozilla/5.0 (compatible; f1-prefetch/1.0)" };
 
-const UA = { "User-Agent": "Mozilla/5.0 (compatible; f1-data-relay/1.0)" };
-
-// 带重试和超时的 GET。
-// 每次失败都要打印原因 —— 上一版把错误吞掉了，导致"跑成功但没产出"，
-// 日志里一句有用的话都没有，排查全靠猜。
-async function get(url, tries = 3) {
+// 带重试、带超时、失败原因一定打印出来
+let lastStatus = 0;      // 最近一次 HTTP 状态码，用来区分"锁站"和"真故障"
+async function of1(url, tries = 3) {
   let lastErr = "未知错误";
   for (let i = 1; i <= tries; i++) {
     try {
-      const r = await fetch(url, { headers: UA, signal: AbortSignal.timeout(25000) });
-      if (r.status === 200) return await r.text();
+      const r = await fetch(url, { headers: UA, signal: AbortSignal.timeout(30000) });
+      lastStatus = r.status;
+      if (r.status === 200) return await r.json();
       lastErr = "HTTP " + r.status;
-      if (r.status === 403 || r.status === 404) {   // 确实没有，重试也没用
+      // 401 = 比赛进行中锁站；404 = 这个端点没有该参数的数据。重试都没用。
+      if (r.status === 401 || r.status === 403 || r.status === 404) {
         console.log(`  [${i}/${tries}] ${lastErr}  ${url}`);
         return null;
       }
@@ -40,122 +40,114 @@ async function get(url, tries = 3) {
       lastErr = (e && e.cause ? (e.cause.code || e.cause.message) : e && e.message) || String(e);
     }
     console.log(`  [${i}/${tries}] 失败: ${lastErr}  ${url}`);
-    if (i < tries) await new Promise(x => setTimeout(x, 1500 * i));
+    if (i < tries) await new Promise(x => setTimeout(x, 2500 * i));
   }
   return null;
 }
 
-const json = async (url) => {
-  const t = await get(url);
-  if (!t) return null;
-  try { return JSON.parse(t); } catch { return null; }
-};
+const step = (t) => console.log(`\n── ${t} ──`);
 
-// "1:35.130" -> 95.13
-function lapToSec(v) {
-  if (!v) return null;
-  const m = /^(\d+):(\d+\.\d+)$/.exec(String(v).trim());
-  if (m) return Number(m[1]) * 60 + Number(m[2]);
-  const s = Number(v);
-  return Number.isFinite(s) ? s : null;
+// ---------- 1) 赛程 ----------
+step("赛程");
+const meetings = await of1(`${OF1}/meetings?year=${YEAR}`);
+const sessions = await of1(`${OF1}/sessions?year=${YEAR}`);
+if (!Array.isArray(meetings) || !Array.isArray(sessions)) {
+  if (lastStatus === 401) {
+    // 比赛进行中 OpenF1 会锁掉整个 API（返回 401），这是它的正常行为，
+    // 不是我们的故障 —— 这种情况不算失败，免得每个比赛周末刷一屏红叉。
+    console.log("");
+    console.log("⏸  OpenF1 正在锁站（HTTP 401）—— 比赛进行中是正常的，本轮跳过。");
+    console.log("   仓库里已有的 data/f1.json 保持不变，等比赛结束下一轮会自动更新。");
+    process.exit(0);
+  }
+  console.error("❌ 拿不到赛程（上面有失败原因）。仓库里已有的 data/f1.json 不会被改动。");
+  process.exit(1);
 }
+console.log(`  meetings ${meetings.length} 站，sessions ${sessions.length} 场`);
 
-console.log(`年份 ${YEAR}，输出 ${OUT_FILE}`);
+// 复刻前端的赛程组装：排除取消的、必须有 Race，按开始时间排序
+const byMeeting = {};
+for (const s of sessions) (byMeeting[s.meeting_key] = byMeeting[s.meeting_key] || []).push(s);
+const realRaces = meetings
+  .filter(m => !m.is_cancelled)
+  .filter(m => (byMeeting[m.meeting_key] || []).some(s => s.session_name === "Race"))
+  .sort((a, b) => new Date(a.date_start) - new Date(b.date_start));
 
-// ---------- 1) 年度索引 ----------
-const index = await json(`${BASE}${YEAR}/Index.json`);
-if (!index || !Array.isArray(index.Meetings)) {
-  console.error("");
-  console.error("❌ 拿不到官方年度索引，本轮不产出。");
-  console.error("   地址  : " + BASE + YEAR + "/Index.json");
-  console.error("   说明  : 仓库里已有的 data/f1.json 不会被改动（本轮不提交任何东西）。");
-  console.error("   原因  : 看上面每次重试打印的错误 —— 最常见是官方 CDN 从这个网络不可达。");
-  console.error("");
-  process.exit(1);   // 必须明确失败。之前这里 exit(0)，
-                     // 结果 Actions 显示"成功"却什么都没做，白排查了半天。
-}
-
-// ---------- 2) 挑出要抓的 session：已结束的排位类 ----------
 const now = Date.now();
-const wanted = [];
-for (const m of index.Meetings) {
-  for (const s of m.Sessions || []) {
-    if (!s.Path || !WANT_TYPES.has(s.Type)) continue;
-    if (!s.EndDate || new Date(s.EndDate).getTime() >= now) continue;   // 还没结束
-    wanted.push({ meeting: m, session: s });
+const past = realRaces.filter(m => {
+  const rc = (byMeeting[m.meeting_key] || []).find(s => s.session_name === "Race");
+  return rc && rc.date_end && new Date(rc.date_end).getTime() < now;
+});
+console.log(`  有效分站 ${realRaces.length}，其中已完赛 ${past.length}`);
+
+// 需要的 key 范围
+const minMk = realRaces.length ? Math.min(...realRaces.map(m => m.meeting_key)) : null;
+const pastKeys = [];
+for (const m of past) {
+  for (const s of (byMeeting[m.meeting_key] || [])) {
+    if (["Race", "Qualifying", "Sprint", "Sprint Qualifying"].includes(s.session_name)) pastKeys.push(s.session_key);
   }
 }
-// 按结束时间倒序，只取最近 MAX_SESSIONS 场
-wanted.sort((a, b) => new Date(b.session.EndDate) - new Date(a.session.EndDate));
-const picked = wanted.slice(0, MAX_SESSIONS);
-console.log(`已结束的排位类 session 共 ${wanted.length} 场，本次处理 ${picked.length} 场`);
+const minKey = pastKeys.length ? Math.min(...pastKeys) : null;
+const lastPast = past.length ? past[past.length - 1] : null;
+const champKey = lastPast ? ((byMeeting[lastPast.meeting_key] || []).find(s => s.session_name === "Race") || {}).session_key : null;
+console.log(`  minMk=${minMk}  minKey=${minKey}  champKey=${champKey}`);
 
-// ---------- 3) 逐场抓取 ----------
-const sessions = {};
-let ok = 0, fail = 0;
-
-for (const { session: s } of picked) {
-  const dir = BASE + s.Path;
-  const info = await json(dir + "SessionInfo.json");
-  const drivers = await json(dir + "DriverList.json");
-  const timing = await json(dir + "TimingData.json");
-
-  const lines = timing && timing.Lines;
-  if (!info || !lines) { fail++; console.log(`  跳过 ${s.Path}（info=${!!info} lines=${!!lines}）`); continue; }
-
-  const results = [];
-  for (const num of Object.keys(lines)) {
-    const L = lines[num] || {};
-    const pos = parseInt(L.Position, 10);
-    const best = L.BestLapTime && L.BestLapTime.Value ? L.BestLapTime.Value : null;
-    const D = (drivers && drivers[num]) || {};
-    if (!Number.isFinite(pos)) continue;
-    results.push({
-      position: pos,
-      number: parseInt(num, 10),
-      name: D.FullName || L.RacingNumber || String(num),
-      tla: D.Tla || null,
-      team: D.TeamName || null,
-      colour: D.TeamColour || null,
-      photo: D.HeadshotUrl || null,
-      bestLap: best,
-      bestLapSec: lapToSec(best),
-      laps: Number.isFinite(L.NumberOfLaps) ? L.NumberOfLaps : null,
-    });
-  }
-  results.sort((a, b) => a.position - b.position);
-  if (!results.length) { fail++; continue; }
-
-  sessions[String(s.Key)] = {
-    key: s.Key,
-    type: s.Type,
-    name: s.Name || s.Type,
-    round: (info.Meeting && info.Meeting.Number) || null,
-    meetingName: (info.Meeting && info.Meeting.Name) || null,
-    officialName: (info.Meeting && info.Meeting.OfficialName) || null,
-    location: (info.Meeting && info.Meeting.Location) || null,
-    circuit: (info.Meeting && info.Meeting.Circuit && info.Meeting.Circuit.ShortName) || null,
-    startDate: info.StartDate || s.StartDate || null,
-    endDate: info.EndDate || s.EndDate || null,
-    gmtOffset: info.GmtOffset || null,
-    status: info.SessionStatus || null,
-    results,
-  };
-  ok++;
-  console.log(`  ✓ ${s.Type} @ ${info.Meeting?.Location || "?"}  key=${s.Key}  ${results.length} 条  P1=#${results[0].number} ${results[0].bestLap || ""}`);
+// ---------- 2) 车手 ----------
+step("车手");
+let drivers = [];
+if (minMk !== null) {
+  const raw = await of1(`${OF1}/drivers?meeting_key>=${minMk}`);
+  if (Array.isArray(raw)) {
+    // 只留本赛季分站 + 同一分站同一车手只留一条（原始响应 1.1 MB，过滤后小很多）
+    const mkSet = new Set(realRaces.map(m => m.meeting_key));
+    const seen = new Set();
+    for (const d of raw) {
+      if (!mkSet.has(d.meeting_key)) continue;
+      const k = d.meeting_key + ":" + d.driver_number;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      drivers.push(d);
+    }
+    console.log(`  原始 ${raw.length} 条 → 过滤后 ${drivers.length} 条`);
+  } else console.log("  ❌ 车手拿不到");
 }
 
-console.log(`完成：成功 ${ok} 场，失败 ${fail} 场`);
+// ---------- 3) 成绩 ----------
+step("成绩");
+let results = [];
+if (minKey !== null) {
+  const r = await of1(`${OF1}/session_result?session_key>=${minKey}`);
+  if (Array.isArray(r)) { results = r; console.log(`  ${r.length} 行`); }
+  else console.log("  ❌ 成绩拿不到");
+} else console.log("  （还没有已完赛的分站）");
 
-// ---------- 4) 写出 ----------
+// ---------- 4) 积分榜 ----------
+step("积分榜");
+let champDrivers = [], champTeams = [];
+if (champKey) {
+  const [cd, ct] = await Promise.all([
+    of1(`${OF1}/championship_drivers?session_key=${champKey}`),
+    of1(`${OF1}/championship_teams?session_key=${champKey}`),
+  ]);
+  if (Array.isArray(cd)) champDrivers = cd;
+  if (Array.isArray(ct)) champTeams = ct;
+  console.log(`  车手积分榜 ${champDrivers.length} 行，车队积分榜 ${champTeams.length} 行`);
+}
+
+// ---------- 5) 写出 ----------
+step("写出");
 const out = {
   updated: new Date().toISOString(),
-  source: "livetiming.formula1.com（F1 官方计时静态数据）",
+  source: "OpenF1（由 GitHub Actions 预取，非官方项目）",
   year: YEAR,
-  count: Object.keys(sessions).length,
-  sessions,
+  minKey, minMk, champKey,
+  meetings, sessions, drivers, results, champDrivers, champTeams,
 };
 
 fs.mkdirSync(path.dirname(OUT_FILE), { recursive: true });
-fs.writeFileSync(OUT_FILE, JSON.stringify(out, null, 1), "utf8");
-console.log(`已写入 ${OUT_FILE}  ${(JSON.stringify(out).length / 1024).toFixed(1)} KB  ${out.count} 场`);
+const body = JSON.stringify(out);
+fs.writeFileSync(OUT_FILE, body, "utf8");
+console.log(`  已写入 ${OUT_FILE}`);
+console.log(`  大小 ${(body.length / 1024).toFixed(0)} KB`);
+console.log(`  meetings ${meetings.length} / sessions ${sessions.length} / drivers ${drivers.length} / results ${results.length} / 积分榜 ${champDrivers.length}+${champTeams.length}`);
