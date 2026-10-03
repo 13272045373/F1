@@ -208,7 +208,9 @@ footer{text-align:center;color:var(--dim2);font-size:11.5px;margin-top:30px;line
 </style>
 <!-- ICON:BEGIN (由 make-text-icons.mjs 生成，勿手改) -->
 <link rel="icon" type="image/svg+xml" href="favicon.svg">
-<link rel="apple-touch-icon" href="favicon.svg">
+<!-- iOS 的 apple-touch-icon 不支持 SVG，必须给 PNG，否则加到主屏幕是白底截图 -->
+<link rel="apple-touch-icon" sizes="192x192" href="icon-192.png">
+<link rel="apple-touch-icon" sizes="512x512" href="icon-512.png">
 <meta name="theme-color" content="#e10600">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
@@ -1862,6 +1864,26 @@ $("#refresh").onclick = async () => {
 };
 
 boot(false);
+
+/* =========================================================
+   注册 Service Worker
+   ---------------------------------------------------------
+   Chrome 判断一个页面「能不能装成 app」有硬性要求，其中一条是
+   【必须有带 fetch 事件处理的 Service Worker】。
+   没有它，「添加到主屏幕」只会创建一个书签 —— 点开还是浏览器（带地址栏）；
+   有了它，Chrome 才会装成 WebAPK：独立图标、独立全屏窗口、任务切换里像个 app。
+
+   顺带好处：静态文件会被缓存，第二次打开几乎瞬开。
+
+   file:// 打开时不注册（浏览器不允许 Service Worker 跑在 file 协议下）。
+   ========================================================= */
+if("serviceWorker" in navigator && /^https?:$/.test(location.protocol)){
+  addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js")
+      .then(() => console.log("[F1助手] Service Worker 已注册 —— 可以从浏览器菜单「安装应用 / 添加到主屏幕」了"))
+      .catch(e => console.warn("[F1助手] Service Worker 注册失败（不影响使用）：", e.message));
+  });
+}
 
 </script>
 </body>
