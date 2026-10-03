@@ -121,6 +121,14 @@ tbody tr:hover{background:#ffffff07}
 .fsess span.done{opacity:.4}
 .fsess span.live{background:#e1060020;border-color:#e1060077;color:#ff7b74;font-weight:700}
 .fsess span.live b{color:#ff7b74}
+/* ---------- 顶栏赛季切换器 ---------- */
+.yearsw{display:flex;align-items:center;gap:1px;background:var(--card2);border:1px solid var(--line);border-radius:9px;padding:2px;margin-right:2px}
+.yearsw button{width:26px;height:26px;border:0;background:transparent;color:var(--dim);font-size:17px;font-weight:800;cursor:pointer;border-radius:7px;line-height:1;padding:0}
+.yearsw button:hover:not(:disabled){background:#ffffff14;color:var(--txt)}
+.yearsw button:disabled{opacity:.22;cursor:default}
+.yearsw b{font-size:13.5px;font-weight:800;color:var(--txt);min-width:40px;text-align:center;font-variant-numeric:tabular-nums}
+@media(max-width:560px){ .yearsw b{min-width:34px;font-size:12.5px} .yearsw button{width:23px;height:23px} }
+
 
 .pos{
   font-weight:800;font-size:15px;font-variant-numeric:tabular-nums;
@@ -244,8 +252,13 @@ footer{text-align:center;color:var(--dim2);font-size:11.5px;margin-top:30px;line
   <div class="wrap">
     <div class="hd">
       <div class="logo">F1 <span>赛事助手</span></div>
-      <div class="sub">2026 赛季 · 赛程 / 排位 / 冲刺 / 正赛 / 积分榜</div>
+      <div class="sub" id="subTitle">赛程 / 排位 / 冲刺 / 正赛 / 积分榜</div>
       <div class="spacer"></div>
+      <div class="yearsw">
+        <button id="yPrev" title="上一年" aria-label="上一年">‹</button>
+        <b id="yLabel">2026</b>
+        <button id="yNext" title="下一年" aria-label="下一年">›</button>
+      </div>
       <span class="stamp" id="stamp"></span>
       <button class="btn" id="refresh">刷新数据</button>
     </div>
@@ -307,12 +320,38 @@ footer{text-align:center;color:var(--dim2);font-size:11.5px;margin-top:30px;line
    配置
    ========================================================= */
 const OF1  = "https://api.openf1.org/v1";
-const YEAR = 2026;
+/* =========================================================
+   赛季（多年份支持）
+   ---------------------------------------------------------
+   原来这里写死 2026 —— 到了 2027 年这个工具就废了。
+   现在：默认跟着系统年份走；12 月 15 日之后自动切到下一年
+   （那时新赛季赛程一般已经公布）。也可以在顶栏手动切，
+   选择会记在 localStorage，下次打开还是那一年。
+   ========================================================= */
+const SEASON_MIN = 2023;            // OpenF1 最早有数据的一年
+const YEAR_KEY   = "f1app_year";
+
+function seasonNow(){
+  const d = new Date();
+  const y = d.getFullYear();
+  return (d.getMonth() === 11 && d.getDate() >= 15) ? y + 1 : y;
+}
+function seasonMax(){ return seasonNow() + 1; }     // 允许提前看下一年
+
+let YEAR = (function(){
+  try{
+    const saved = Number(localStorage.getItem(YEAR_KEY));
+    if(saved >= SEASON_MIN && saved <= seasonMax()) return saved;
+  }catch(e){}
+  return seasonNow();
+})();
 /* 缓存键。2026-10-03 换到 f1app3：
    旧版缓存的 drivers 里只存了"已完赛分站"的车手，于是刚跑完排位、正赛还没跑的
    这一站查不到车手 —— 成绩表里只剩 #18 #43 这样的车号，没有名字/头像/车队。
    光改取数逻辑不够：旧缓存还在 localStorage 里躺着，TTL 是 3 天，不换键就一直不刷新。 */
-const LS_KEY   = "f1app3_" + YEAR;
+/* 缓存键带年份 —— 不同赛季各存各的，来回切不会串数据。
+   写成函数是因为 YEAR 现在是可以变的。 */
+const LSK = function(){ return "f1app3_" + YEAR; };
 const CACHE_TTL = 5 * 60 * 1000;        // 内存缓存 5 分钟
 const RESULT_TTL = 10 * 60 * 1000;      // 成绩表本地缓存 10 分钟（10 分钟内重开不用再请求）
 const SCHEDULE_TTL = 3 * 24 * 60 * 60 * 1000;   // 赛程缓存 3 天
@@ -481,10 +520,14 @@ function of1Slot(){
    raw.githubusercontent 在部分网络（尤其是国内手机网络）下是"连不上也不拒绝"的黑洞，
    没有超时就会一直挂着 —— 而 of1() 的每个请求都要先等这里，
    结果整个页面卡在「正在获取赛程… 加载中 33%」永远不动。 */
-const PREFETCH_URLS = [
-  "data/f1.json",                                       // 同源：GitHub Pages 上就是本站，本地 server.js 也能用
-  "https://13272045373.github.io/F1/data/f1.json"       // 国内可达（实测 200 且带 CORS）
-];
+function prefetchUrls(){
+  return [
+    "data/f1-" + YEAR + ".json",                                   // 按年份归档（多赛季用这个）
+    "https://13272045373.github.io/F1/data/f1-" + YEAR + ".json",
+    "data/f1.json",                                                // 兼容早期的单文件版
+    "https://13272045373.github.io/F1/data/f1.json"
+  ];
+}
 /* 原来还兜底试 raw.githubusercontent.com —— 已去掉：
    那个域名在国内基本连不上，而它不拒绝、只是不回应，
    每次打开都要白等 3 秒超时才有结果。上面两个地址已经覆盖所有实际场景
@@ -511,10 +554,12 @@ function prefetch(){
   if(_pfP) return _pfP;                    // 6 个请求同时来，只发一次
   const errs = [];
   _pfP = (async () => {
-    for(const url of PREFETCH_URLS){
+    for(const url of prefetchUrls()){
       try{
         const j = await fetchJsonTimeout(url, PREFETCH_TIMEOUT);
         if(!j || !Array.isArray(j.meetings)) throw new Error("内容不对");
+        /* 包里自带年份 —— 对不上就不能用，否则切到 2025 会显示 2026 的数据 */
+        if(j.year != null && Number(j.year) !== YEAR) throw new Error("包里是 " + j.year + " 赛季");
         const age = Date.now() - new Date(j.updated).getTime();
         if(!(age < PREFETCH_MAX_AGE)) throw new Error("包太旧（" + Math.round(age / 60000) + " 分钟前）");
         _pfData = j; _pfAt = Date.now();
@@ -772,12 +817,24 @@ function ergastStatus(row){
      1.16MB 的同步写入在手机上会明显卡顿甚至超配额，这是之前“卡在 60%”的元凶。 */
 let _store = { meetings: null, meetingsAt: 0, sessions: null, sessionsAt: 0, drivers: null, driversAt: 0,
                 result: null, resultAt: 0 };
-try{
-  const raw = localStorage.getItem(LS_KEY);
-  if(raw) _store = Object.assign(_store, JSON.parse(raw));
-}catch(e){}
+/* 读本地缓存。抽成函数是为了切赛季时能重新读一遍 ——
+   每个赛季的缓存存在不同的键下（LSK() 里带年份）。 */
+function loadStore(){
+  try{
+    const raw = localStorage.getItem(LSK());
+    if(raw) _store = Object.assign(_store, JSON.parse(raw));
+  }catch(e){}
+}
+/* 切赛季前把内存里的缓存清干净。
+   否则新赛季取数失败时会退回上一个赛季的缓存，显示出错年份的数据。 */
+function clearStore(){
+  _store = { meetings: null, meetingsAt: 0, sessions: null, sessionsAt: 0, drivers: null, driversAt: 0,
+             result: null, resultAt: 0 };
+}
+loadStore();
+
 function saveStore(){
-  try{ localStorage.setItem(LS_KEY, JSON.stringify(_store)); }catch(e){}
+  try{ localStorage.setItem(LSK(), JSON.stringify(_store)); }catch(e){}
 }
 
 /* ---------- 结果快照 ----------
@@ -789,7 +846,7 @@ const SNAP_TTL = 7 * 24 * 60 * 60 * 1000;
 
 function saveSnapshot(){
   try{
-    localStorage.setItem(LS_KEY + "_snap", JSON.stringify({
+    localStorage.setItem(LSK() + "_snap", JSON.stringify({
       at: Date.now(),
       races: S.races,
       results: S.results,
@@ -805,7 +862,7 @@ function saveSnapshot(){
 
 function loadSnapshot(){
   try{
-    const raw = localStorage.getItem(LS_KEY + "_snap");
+    const raw = localStorage.getItem(LSK() + "_snap");
     if(!raw) return null;
     const s = JSON.parse(raw);
     if(!s || !Array.isArray(s.races) || !s.races.length) return null;
@@ -1976,6 +2033,48 @@ function switchTab(name){
 }
 document.querySelectorAll(".tab").forEach(t => { t.onclick = () => switchTab(t.dataset.tab); });
 
+
+/* =========================================================
+   赛季切换
+   ---------------------------------------------------------
+   这个工具打算用很多年，所以年份不能写死。
+   切换时要把所有跟年份有关的东西都换掉：
+   内存缓存、预取包副本、当前数据、本地缓存（按年份分开存）。
+   ========================================================= */
+function renderYearSwitcher(){
+  const lbl = document.getElementById("yLabel");
+  if(lbl) lbl.textContent = YEAR;
+  const p = document.getElementById("yPrev"), n = document.getElementById("yNext");
+  if(p) p.disabled = YEAR <= SEASON_MIN;
+  if(n) n.disabled = YEAR >= seasonMax();
+  const sub = document.getElementById("subTitle");
+  if(sub) sub.textContent = YEAR + " 赛季 · 赛程 / 排位 / 冲刺 / 正赛 / 积分榜";
+}
+
+async function setYear(y){
+  if(y < SEASON_MIN || y > seasonMax() || y === YEAR) return;
+  console.log("[F1助手] 切换赛季：" + YEAR + " → " + y);
+  YEAR = y;
+  try{ localStorage.setItem(YEAR_KEY, String(y)); }catch(e){}
+
+  _cache.clear();                              // 内存请求缓存
+  _pfData = null; _pfAt = 0; _pfWarned = false; // 预取包（要按新年份重读）
+
+  // 只重置数据字段，不动 S 的结构
+  S.races = []; S.drivers = {};
+  S.results = {}; S.quali = {}; S.sprint = {};
+  S.ds = []; S.cs = []; S.failed = [];
+  S.loaded = false; S.source = null;
+  S.standingsRound = null; S.standingsMeeting = null;
+
+  // 先清空内存缓存，再读新年份的本地缓存（每个赛季各存各的键）
+  clearStore();
+  loadStore();
+
+  renderYearSwitcher();
+  await boot(true);
+}
+
 async function boot(force){
   /* 点「刷新数据」时必须把本地缓存的 TTL 也清掉。
      以前只清内存缓存，赛程仍走 3 天的 localStorage 缓存 →
@@ -2042,6 +2141,11 @@ $("#refresh").onclick = async () => {
   await boot(true);
   b.disabled = false; b.textContent = "刷新数据";
 };
+
+/* 顶栏赛季切换 */
+document.getElementById("yPrev").onclick = function(){ setYear(YEAR - 1); };
+document.getElementById("yNext").onclick = function(){ setYear(YEAR + 1); };
+renderYearSwitcher();
 
 boot(false);
 
