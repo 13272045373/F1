@@ -40,8 +40,9 @@ jobs:
         run: |
           mkdir -p data
           {
-            echo "探测时间(UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "出口 IP      : $(curl -s --max-time 10 https://api.ipify.org || echo '取不到')"
+            # 故意不写时间戳：内容不变就不会产生新提交。
+            # 之前这里带 $(date ...)，导致每 10 分钟就往仓库提交一次 probe.txt（一天 144 次）。
+            echo "本文件由「探测数据源可达性」步骤生成，内容不变则不会重复提交。"
             echo ""
             echo "===== 各数据源可达性 ====="
             probe() {
@@ -83,9 +84,15 @@ jobs:
           fi
           echo "✅ 找到 fetch-f1.mjs"
 
+      # 年份不再写死 —— 自动用当前年份。
+      # 这样这个 workflow 明年、后年都不用手动改。
+      - name: 计算赛季年份
+        id: season
+        run: echo "year=$(date -u +%Y)" >> "$GITHUB_OUTPUT"
+
       - name: 抓取数据（预取 OpenF1）
         env:
-          F1_YEAR: "2026"
+          F1_YEAR: ${{ steps.season.outputs.year }}
           F1_OUT: "data/f1.json"
           F1_MAX_SESSIONS: "40"
         run: node fetch-f1.mjs
