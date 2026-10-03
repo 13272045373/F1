@@ -288,7 +288,11 @@ footer{text-align:center;color:var(--dim2);font-size:11.5px;margin-top:30px;line
    ========================================================= */
 const OF1  = "https://api.openf1.org/v1";
 const YEAR = 2026;
-const LS_KEY   = "f1app2_" + YEAR;      // 换了数据源，缓存键也换
+/* 缓存键。2026-10-03 换到 f1app3：
+   旧版缓存的 drivers 里只存了"已完赛分站"的车手，于是刚跑完排位、正赛还没跑的
+   这一站查不到车手 —— 成绩表里只剩 #18 #43 这样的车号，没有名字/头像/车队。
+   光改取数逻辑不够：旧缓存还在 localStorage 里躺着，TTL 是 3 天，不换键就一直不刷新。 */
+const LS_KEY   = "f1app3_" + YEAR;
 const CACHE_TTL = 5 * 60 * 1000;        // 内存缓存 5 分钟
 const RESULT_TTL = 10 * 60 * 1000;      // 成绩表本地缓存 10 分钟（10 分钟内重开不用再请求）
 const SCHEDULE_TTL = 3 * 24 * 60 * 60 * 1000;   // 赛程缓存 3 天
@@ -439,12 +443,82 @@ function of1Slot(){
   return p;
 }
 
+/* =========================================================
+   预取包
+   ---------------------------------------------------------
+   GitHub Actions 每 10 分钟把 OpenF1 的数据抓下来，打包成仓库里的一个静态文件。
+   优先读它：一次静态请求顶掉原本的 6 次接口调用，而且完全不碰 OpenF1 的限流
+   （实测短时间内连打十来个请求就会被 429，而那正是"比赛后很慢"的主因）。
+
+   读不到、或者包太旧了，就照旧直连 OpenF1。
+   ========================================================= */
+const PREFETCH_JSON = "https://raw.githubusercontent.com/13272045373/F1/main/data/f1.json";
+const PREFETCH_TTL      = 5 * 60 * 1000;    // 同一次会话里，5 分钟内不重复读这个文件
+const PREFETCH_MAX_AGE  = 40 * 60 * 1000;   // 包里的 updated 超过 40 分钟就当它不新鲜，改直连
+
+let _pfP = null, _pfAt = 0, _pfData = null, _pfWarned = false;
+
+function prefetch(){
+  if(_pfData && (Date.now() - _pfAt) < PREFETCH_TTL) return Promise.resolve(_pfData);
+  if(_pfP) return _pfP;                    // 6 个请求同时来，只发一次
+  _pfP = (async () => {
+    try{
+      const r = await fetch(PREFETCH_JSON, { cache: "no-store" });
+      if(!r.ok) throw new Error("HTTP " + r.status);
+      const j = await r.json();
+      if(!j || !Array.isArray(j.meetings)) throw new Error("内容不对");
+      const age = Date.now() - new Date(j.updated).getTime();
+      if(!(age < PREFETCH_MAX_AGE)) throw new Error("包太旧（" + Math.round(age / 60000) + " 分钟前）");
+      _pfData = j; _pfAt = Date.now();
+      return j;
+    }catch(e){
+      if(!_pfWarned){ console.warn("[F1助手] 预取包用不上，改直连 OpenF1：", e.message); _pfWarned = true; }
+      _pfData = null; _pfAt = Date.now();
+      return null;
+    }finally{ _pfP = null; }
+  })();
+  return _pfP;
+}
+
+/* 把 OpenF1 的请求路径映射到预取包里的切片。
+   映射不了、或者请求的范围比包里存的还大，就返回 undefined 让上层去直连。 */
+function of1FromBundle(pathStr, b){
+  const q = pathStr.split("?")[1] || "";
+  const p = pathStr.split("?")[0];
+  const ge = k => { const m = new RegExp(k + ">=(\\d+)").exec(q); return m ? Number(m[1]) : null; };
+  const eq = k => { const m = new RegExp(k + "=(\\d+)").exec(q);   return m ? Number(m[1]) : null; };
+
+  if(p === "/meetings") return b.meetings;
+  if(p === "/sessions") return b.sessions;
+
+  if(p === "/drivers"){
+    const n = ge("meeting_key");
+    if(n === null || (b.minMk != null && n < b.minMk)) return undefined;
+    return b.drivers.filter(d => d.meeting_key >= n);
+  }
+  if(p === "/session_result"){
+    const n = ge("session_key");
+    if(n === null || (b.minKey != null && n < b.minKey)) return undefined;
+    return b.results.filter(r => r.session_key >= n);
+  }
+  if(p === "/championship_drivers") return eq("session_key") === b.champKey ? b.champDrivers : undefined;
+  if(p === "/championship_teams")   return eq("session_key") === b.champKey ? b.champTeams   : undefined;
+  return undefined;
+}
+
 function of1(path, retries = 2){
   const url = OF1 + path;
   const hit = _cache.get(url);
   if(hit && Date.now() - hit.t < CACHE_TTL) return hit.p;
 
   const p = (async () => {
+    // 先看预取包里有没有
+    const b = await prefetch();
+    if(b){
+      const sliced = of1FromBundle(path, b);
+      if(sliced !== undefined) return sliced;
+    }
+    // 走到这里说明预取包没覆盖这次请求 —— 直连 OpenF1
     for(let i = 0; i <= retries; i++){
       await of1Slot();        // 排队 + 节流，避免触发 429
       // 用 AbortController 加超时：网络卡住时会中断并重试，不会一直挂着
@@ -902,7 +976,22 @@ async function loadAll(onProgress, onScheduleReady){
   // ============ 阶段 2：车手 / 成绩 / 积分榜（三者并行）============
   P(2, 3, "获取成绩与积分榜");
 
-  const needD = !(_store.drivers && _store.driversAt && (Date.now() - _store.driversAt) < SCHEDULE_TTL);
+  /* 光看 TTL 不够：缓存里必须已经覆盖「所有已经开始过的分站」。
+     否则就会出现「成绩有了、但车手名字和头像没有」——
+     因为 drivers 缓存是旧的，而 TTL 还早，不会自动刷新。
+     这条检查让它自愈，不用再靠手动清缓存。 */
+  const cachedMk = new Set((_store.drivers || []).map(d => d.meeting_key));
+  const needMk = new Set();
+  for(const r of S.races){
+    const t = r.times.quali || r.times.race;
+    if(t && new Date(t).getTime() < now) needMk.add(r.meeting_key);
+  }
+  const missMk = [...needMk].filter(mk => !cachedMk.has(mk));
+  if(missMk.length && _store.drivers){
+    console.warn("[F1助手] 车手缓存缺 " + missMk.length + " 个分站（" + missMk.join(",") + "），强制重新拉取");
+  }
+  const needD = missMk.length > 0
+    || !(_store.drivers && _store.driversAt && (Date.now() - _store.driversAt) < SCHEDULE_TTL);
   const minMk  = S.races.length ? Math.min(...S.races.map(r => r.meeting_key)) : null;
 
   // 需要哪些 session（已完赛的排位/冲刺/正赛）
@@ -1554,7 +1643,11 @@ function sessionTable(rows, kind, meetingKey){
     const col = d.colour || "#7a8296";
     const st = statusText(r);
     const pos = r.position ?? (st ? "—" : ++shown);
-    const cls = pos === 1 ? "p1" : pos === 2 ? "p2" : pos === 3 ? "p3" : (st ? "pd" : "");
+    /* pd 是给「没有名次」的行用的（灰色 + 小两号字，原本是给那个破折号配的）。
+       以前只要 dnf/dns/dsq 为真就套上，结果有名次的行字号也从 15px 掉到 13px，
+       看起来就像"这两个数字字体不一样"。有名次就正常显示。 */
+    const cls = pos === 1 ? "p1" : pos === 2 ? "p2" : pos === 3 ? "p3"
+              : (!r.position && st ? "pd" : "");
 
     let cell;
     if(isRace){
