@@ -1,19 +1,19 @@
 本文件由「探测数据源可达性」步骤生成，内容不变则不会重复提交。
 
 ===== 各数据源可达性 =====
-官方 live timing（已测 403）                   HTTP 403  0.202248s  919 字节
-F1 官网成绩页                                   HTTP 200  0.082434s  457731 字节
-F1 官网赛程页                                   HTTP 301  0.133826s  162 字节
-OpenF1                                               HTTP 401  0.486598s  214 字节
-Jolpica                                              HTTP 200  0.318733s  800 字节
-f1api.dev                                            HTTP 200  4.704718s  29348 字节
-GitHub raw（对照）                               HTTP 200  0.137333s  99207 字节
+官方 live timing（已测 403）                   HTTP 403  0.177314s  919 字节
+F1 官网成绩页                                   HTTP 200  0.235726s  464126 字节
+F1 官网赛程页                                   HTTP 301  0.132586s  162 字节
+OpenF1                                               HTTP 200  0.481770s  377 字节
+Jolpica                                              HTTP 200  0.406877s  800 字节
+f1api.dev                                            HTTP 200  5.708690s  29348 字节
+GitHub raw（对照）                               HTTP 200  0.152747s  99207 字节
 
 ===== F1 官网成绩页内容检查 =====
-  抓到 457731 字节
+  抓到 464126 字节
   关键词 Sepang       出现 0
   关键词 Malaysia     出现 2
   关键词 Kuala        出现 0
-  关键词 Verstappen   出现 0
+  关键词 Verstappen   出现 2
   关键词 Hamilton     出现 2
   关键词 Qualifying   出现 0
