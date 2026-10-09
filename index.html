@@ -1341,10 +1341,12 @@ async function loadFromJolpica(onProgress){
   const jRaces = (sch.MRData && sch.MRData.RaceTable && sch.MRData.RaceTable.Races) || [];
   if(!jRaces.length) throw new Error("Jolpica 没返回赛程");
 
-  /* Ergast 的 races.json 里带了各阶段的日期和时间（Qualifying / Sprint），
-     所以备用源也能显示排位和冲刺的开赛时间，不只是正赛。
-     唯一缺的是「冲刺排位」（Ergast 没这个字段），由 mergeSessionTimes 从
-     OpenF1 缓存补；补不到就不显示（sessionLines 会自动跳过该行）。
+  /* Jolpica 的 races.json 里带了各阶段的日期和时间
+     （FirstPractice / SecondPractice / ThirdPractice / Qualifying / Sprint / SprintQualifying），
+     所以备用源也能显示各阶段的开赛时间，不只是正赛。
+     注意「冲刺排位」的时间它现在是给的（字段 SprintQualifying），直接读；
+     以前这里写着「Ergast 没这个字段」，是过时的判断，导致备用源下
+     冲刺排位整块消失。它唯一缺的是冲刺排位的【成绩】—— 没有对应端点。
 
      date 必须按北京时区算：Jolpica 的 r.date 是当地日期，
      美洲站在北京时间会跨天，直接用它会和下面的开赛时间自相矛盾。 */
@@ -1356,6 +1358,12 @@ async function loadFromJolpica(onProgress){
     const raceIso   = joinIso(r.date, r.time);
     const qualiIso  = r.Qualifying ? joinIso(r.Qualifying.date, r.Qualifying.time) : null;
     const sprintIso = r.Sprint     ? joinIso(r.Sprint.date,     r.Sprint.time)     : null;
+    /* Jolpica 的 races.json 里其实是有「冲刺排位」的，字段名 SprintQualifying。
+       以前这里只读了 Qualifying 和 Sprint，于是备用源下冲刺排位整块凭空消失
+       （OpenF1 锁站降级时就会看到这个现象）。
+       注意：它只给时间，不给成绩 —— Jolpica 没有冲刺排位的成绩端点。 */
+    const sprintqIso = r.SprintQualifying
+      ? joinIso(r.SprintQualifying.date, r.SprintQualifying.time) : null;
     const start = new Date(raceIso);
     const end   = new Date(start.getTime() + 2 * 3600 * 1000);
     return {
@@ -1368,13 +1376,13 @@ async function loadFromJolpica(onProgress){
       flag: flagUrl(loc.country),
       date: bjDate(raceIso) || r.date,
       circuit: (r.Circuit && r.Circuit.circuitName) || "",
-      times: { sprintq: null, sprint: sprintIso, quali: qualiIso, race: raceIso },
-      /* Ergast/Jolpica 只给开始时间，没给结束时间 —— 按 F1 标准时长估：
-         冲刺赛 60 分、排位 75 分、正赛 150 分（正赛上限 2 小时，留点余量）。 */
+      times: { sprintq: sprintqIso, sprint: sprintIso, quali: qualiIso, race: raceIso },
+      /* Jolpica 只给开始时间，没给结束时间 —— 按 F1 标准时长估：
+         冲刺排位 60 分、冲刺赛 60 分、排位 75 分、正赛 150 分（上限 2 小时留余量）。 */
       ends: {
-        sprintq: null,
-        sprint:  sprintIso ? new Date(new Date(sprintIso).getTime() + 60 * 60000).toISOString() : null,
-        quali:   qualiIso  ? new Date(new Date(qualiIso).getTime()  + 75 * 60000).toISOString() : null,
+        sprintq: sprintqIso ? new Date(new Date(sprintqIso).getTime() + 60 * 60000).toISOString() : null,
+        sprint:  sprintIso  ? new Date(new Date(sprintIso).getTime()  + 60 * 60000).toISOString() : null,
+        quali:   qualiIso   ? new Date(new Date(qualiIso).getTime()   + 75 * 60000).toISOString() : null,
         race:    isNaN(end) ? null : end.toISOString()
       },
       raceStart: raceIso,
@@ -1647,13 +1655,18 @@ function nextRound(){
 function sessionLines(r){
   const t = r.times || {};
   const rows = [];
-  if(t.sprintq) rows.push(["冲刺排位", t.sprintq]);
+  // 冲刺排位用 hasStage 判断 —— 有冲刺赛就一定有它，
+  // 时间拿不到时显示「时间待定」，而不是整行消失。
+  if(hasStage(r, "sprintq")) rows.push(["冲刺排位", t.sprintq, "时间待定"]);
   if(t.sprint)  rows.push(["冲刺赛",   t.sprint]);
   if(t.quali)   rows.push(["排位赛",   t.quali]);
   if(t.race)    rows.push(["正赛",     t.race]);
   if(!rows.length) return "";
-  return '<div class="rsess">' + rows.map(([k, v]) =>
-    '<span><i>' + esc(k) + '</i>' + esc(fmtSession(v)) + '</span>').join("") + '</div>';
+  return '<div class="rsess">' + rows.map(function(row){
+    const label = row[0], iso = row[1], fallback = row[2];
+    const txt = iso ? fmtSession(iso) : (fallback || "—");
+    return '<span><i>' + esc(label) + '</i>' + esc(txt) + '</span>';
+  }).join("") + '</div>';
 }
 function flagImg(race){
   if(!race?.flag) return "";
@@ -1942,7 +1955,12 @@ function emptyStateFor(r, kind){
   const label = STAGE_LABEL[kind] || kind;
   const iso = r && r.times ? r.times[kind] : null;
 
-  if(!iso) return { cls: "none", text: "本站没有" + label + "（传统赛制周末）" };
+  if(!iso){
+    // 阶段存在但时间未知（冲刺排位可能这样）—— 不能说成「本站没有」
+    if(r && hasStage(r, kind))
+      return { cls: "pending", text: "本站有" + label + "，但当前数据源没有给出时间与成绩" };
+    return { cls: "none", text: "本站没有" + label + "（传统赛制周末）" };
+  }
 
   const s = new Date(iso).getTime();
   if(isNaN(s)) return { cls: "none", text: "本站没有" + label };
@@ -2043,9 +2061,19 @@ function renderResultsList(){
   });
 }
 
-/* 一个比赛周末显示哪几个阶段，取决于这个周末实际有哪些阶段 ——
-   不能看「有没有成绩」，否则还没开跑的冲刺赛会整块消失（新加坡站就是这样）。
-   传统赛制周末只有排位赛和正赛，冲刺排位/冲刺赛不会出现。 */
+/* 这个阶段在不在这个周末里。
+   用它决定渲染哪几块和赛程行显示哪几行 ——
+   两个都不能看「有没有成绩」：还没开跑的阶段会整块消失，
+   新加坡站截图里冲刺赛和冲刺排位一起不见就是这个原因。
+   冲刺排位另加一层兜底：不是每个数据来源都给它的时间，
+   但 F1 的规则是「有冲刺赛的周末必定有冲刺排位」，用冲刺赛推断。 */
+function hasStage(r, kind){
+  if(!r || !r.times) return false;
+  if(r.times[kind]) return true;
+  if(kind === "sprintq") return !!r.times.sprint;
+  return false;
+}
+
 function stageBlocks(r, round, mk){
   const bucketOf = function(k){
     if(k === "race")   return S.results;
@@ -2054,13 +2082,13 @@ function stageBlocks(r, round, mk){
     return S.sprintq;
   };
   return STAGE_ORDER
-    .filter(function(st){ return r.times && r.times[st.kind]; })
+    .filter(function(st){ return hasStage(r, st.kind); })
     .map(function(st){
       const bucket = bucketOf(st.kind) || {};
       return '<div class="sess">' +
         '<div class="sess-h"><span class="ln" style="background:' + st.colour + '"></span>' +
           esc(st.label) + ' ' + esc(st.en) +
-          '<span class="muted">' + esc(fmtSession(r.times[st.kind])) + '</span></div>' +
+          '<span class="muted">' + esc(r.times[st.kind] ? fmtSession(r.times[st.kind]) : "时间待定") + '</span></div>' +
         sessionTable(bucket[round], st.kind, mk, r) +
       '</div>';
     }).join("");
