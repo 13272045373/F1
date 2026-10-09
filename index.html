@@ -543,7 +543,13 @@ function prefetchUrls(){
    （Pages 用同源、本地 file:// 用 github.io）。 */
 const PREFETCH_TIMEOUT = 4000;              // 单个地址最多等 4 秒
 const PREFETCH_TTL      = 5 * 60 * 1000;    // 同一次会话里，5 分钟内不重复读
-const PREFETCH_MAX_AGE  = 40 * 60 * 1000;   // 包里的 updated 超过 40 分钟就当它不新鲜，改直连
+/* 包里 updated 超过这个时长就当它彻底不可信。
+   为什么放到 12 小时这么宽：实测 GitHub 对公开仓库的 schedule 有节流，
+   设的是每 10 分钟，实际 4~7 小时才跑一次（记录在案的间隔是 4.3 / 4.5 / 5.7 / 7.0 / 7.4 小时）。
+   按 40 分钟判定的话包几乎永远是"过期"的，等于白做。
+   现在改成按数据类型分工（见 of1 里的 needsFresh），
+   所以这里放宽只影响"直连也失败时能拿到的兜底数据有多旧"。 */
+const PREFETCH_MAX_AGE  = 12 * 60 * 60 * 1000;
 
 let _pfP = null, _pfAt = 0, _pfData = null, _pfWarned = false;
 
@@ -614,19 +620,28 @@ function of1FromBundle(pathStr, b){
   return undefined;
 }
 
+/* 这个请求是否必须尽量新鲜。
+   赛程、场次、车手一个赛季基本不变（最多赛后多一条），用预取包就够 ——
+   又快，也不占 OpenF1 那点很紧的限流额度。
+   成绩和积分榜每场比赛都在变，优先直连。 */
+function needsFresh(path){
+  return path.indexOf("/session_result") === 0
+      || path.indexOf("/championship_") === 0;
+}
+
 function of1(path, retries = 2){
   const url = OF1 + path;
   const hit = _cache.get(url);
   if(hit && Date.now() - hit.t < CACHE_TTL) return hit.p;
 
   const p = (async () => {
-    // 先看预取包里有没有
     const b = await prefetch();
-    if(b){
-      const sliced = of1FromBundle(path, b);
-      if(sliced !== undefined) return sliced;
-    }
-    // 走到这里说明预取包没覆盖这次请求 —— 直连 OpenF1
+    const fromBundle = (b ? of1FromBundle(path, b) : undefined);
+
+    /* 少变的数据直接用预取包 */
+    if(fromBundle !== undefined && !needsFresh(path)) return fromBundle;
+
+    const direct = async () => {
     for(let i = 0; i <= retries; i++){
       await of1Slot();        // 排队 + 节流，避免触发 429
       // 用 AbortController 加超时：网络卡住时会中断并重试，不会一直挂着
@@ -667,6 +682,20 @@ function of1(path, retries = 2){
         if(i >= maxTry){ _cache.delete(url); throw e; }
         await new Promise(x => setTimeout(x, 800 * (i + 1)));
       }
+    }
+    };
+
+    /* 会变的数据：先直连取最新的；直连拿不到（OpenF1 锁站 401 / 限流 429 / 网络不通）
+       就退回预取包里那份。有旧数据总比一片空白强 ——
+       比如冲刺排位，备用源根本不给成绩，包里的那份就是唯一的来源。 */
+    try{
+      return await direct();
+    }catch(e){
+      if(fromBundle !== undefined){
+        console.warn("[F1助手] " + path + " 直连失败，退回预取包：" + e.message);
+        return fromBundle;
+      }
+      throw e;
     }
   })();
   _cache.set(url, { t: Date.now(), p });
