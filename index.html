@@ -127,6 +127,10 @@ tbody tr:hover{background:#ffffff07}
 .yearsw button:hover:not(:disabled){background:#ffffff14;color:var(--txt)}
 .yearsw button:disabled{opacity:.22;cursor:default}
 .yearsw b{font-size:13.5px;font-weight:800;color:var(--txt);min-width:40px;text-align:center;font-variant-numeric:tabular-nums}
+.msg.future{color:var(--dim)}
+.msg.live{color:#ff7b74;font-weight:700}
+.msg.pending{color:var(--gold)}
+.msg.none{color:var(--dim2)}
 @media(max-width:560px){ .yearsw b{min-width:34px;font-size:12.5px} .yearsw button{width:23px;height:23px} }
 
 
@@ -857,6 +861,7 @@ function saveSnapshot(){
       results: S.results,
       quali: S.quali,
       sprint: S.sprint,
+      sprintq: S.sprintq,
       ds: S.ds,
       cs: S.cs,
       standingsRound: S.standingsRound,
@@ -881,6 +886,7 @@ function applySnapshot(s){
   S.results = s.results || {};
   S.quali   = s.quali   || {};
   S.sprint  = s.sprint  || {};
+  S.sprintq = s.sprintq || {};
   S.ds = s.ds || [];
   S.cs = s.cs || [];
   S.standingsRound   = (s.standingsRound === undefined)   ? null : s.standingsRound;
@@ -1087,10 +1093,14 @@ async function loadAll(onProgress, onScheduleReady){
       },
       raceStart: rc ? rc.date_start : m.date_start,
       raceEnd:   rc ? rc.date_end   : m.date_end,
+      /* 四个阶段都要登记 session_key —— 取数范围（pastKeys）和
+         结果归类都从这张表推。以前漏了 sprintq，导致冲刺排位的成绩
+         根本没去请求、也没有对应的结果桶。 */
       sessions: {
-        quali:  q  ? q.session_key : null,
-        sprint: sp ? sp.session_key : null,
-        race:   rc ? rc.session_key : null
+        sprintq: sq ? sq.session_key : null,
+        sprint:  sp ? sp.session_key : null,
+        quali:   q  ? q.session_key : null,
+        race:    rc ? rc.session_key : null
       }
     };
   });
@@ -1127,7 +1137,8 @@ async function loadAll(onProgress, onScheduleReady){
   // 需要哪些 session（已完赛的排位/冲刺/正赛）
   const pastKeys = [];
   for(const r of past){
-    for(const k of ["quali","sprint","race"]){
+    // 四个阶段都要取。顺序按比赛周末的时间先后。
+    for(const k of ["sprintq","quali","sprint","race"]){
       if(r.sessions[k]) pastKeys.push({ round: r.round, kind: k, key: r.sessions[k] });
     }
   }
@@ -1209,7 +1220,7 @@ async function loadAll(onProgress, onScheduleReady){
   }
 
   // ---- 成绩 ----
-  S.results = {}; S.quali = {}; S.sprint = {};
+  S.results = {}; S.quali = {}; S.sprint = {}; S.sprintq = {};
   S.failed = [];
   if(rows){
     const byKey = {};
@@ -1221,7 +1232,7 @@ async function loadAll(onProgress, onScheduleReady){
        界面就显示「本站无此阶段数据」。
        改成遍历全部分站：没数据的 byKey[key] 自然为空、continue 跳过。 */
     for(const r of S.races){
-      for(const k of ["quali", "sprint", "race"]){
+      for(const k of ["sprintq", "quali", "sprint", "race"]){
         const key = r.sessions[k];
         if(!key) continue;
         const list = (byKey[key] || []).slice().sort((a, b) => {
@@ -1229,9 +1240,10 @@ async function loadAll(onProgress, onScheduleReady){
           return pa - pb;
         });
         if(!list.length) continue;
-        if(k === "race")       S.results[r.round] = list;
-        else if(k === "quali") S.quali[r.round]   = list;
-        else                   S.sprint[r.round]  = list;
+        if(k === "race")         S.results[r.round] = list;
+        else if(k === "quali")   S.quali[r.round]   = list;
+        else if(k === "sprint")  S.sprint[r.round]  = list;
+        else                     S.sprintq[r.round] = list;
       }
     }
   }
@@ -1369,7 +1381,10 @@ async function loadFromJolpica(onProgress){
       raceEnd: isNaN(end) ? null : end.toISOString(),
       /* sprint 只在该站真有冲刺赛时才有值。
          之前一律填轮次号，结果每一站都被标上「冲刺」徽章。 */
-      sessions: { quali: round, sprint: r.Sprint ? round : null, race: round }
+      /* Ergast 没有「冲刺排位」的成绩，也拿不到它的 session_key，
+         所以这里恒为 null。时间由 mergeSessionTimes 从 OpenF1 缓存补；
+         补到了就会渲染出这一块，成绩为空时提示「备用源不提供」。 */
+      sessions: { sprintq: null, quali: round, sprint: r.Sprint ? round : null, race: round }
     };
   });
 
@@ -1421,7 +1436,7 @@ async function loadFromJolpica(onProgress){
   /* ---- 结果归类 ---- */
   const orderPos = (a, b) => (a.position ?? 999) - (b.position ?? 999);
 
-  S.results = {}; S.quali = {}; S.sprint = {}; S.failed = [];
+  S.results = {}; S.quali = {}; S.sprint = {}; S.sprintq = {}; S.failed = [];
 
   // 正赛 / 冲刺赛
   const buildRaceRow = (row, leaderMs) => {
@@ -1905,8 +1920,48 @@ function renderStandings(){
 /* =========================================================
    渲染：成绩表
    ========================================================= */
-function sessionTable(rows, kind, meetingKey){
-  if(!rows || !rows.length) return '<div class="card"><div class="msg">本站无此阶段数据。</div></div>';
+/* 阶段的中文名和顺序（按比赛周末的时间先后） */
+const STAGE_ORDER = [
+  { kind: "sprintq", label: "冲刺排位", en: "Sprint Qualifying", colour: "var(--blue)" },
+  { kind: "sprint",  label: "冲刺赛",   en: "Sprint",            colour: "var(--gold)" },
+  { kind: "quali",   label: "排位赛",   en: "Qualifying",        colour: "var(--red)"  },
+  { kind: "race",    label: "正赛",     en: "Grand Prix",        colour: "var(--green)" }
+];
+const STAGE_LABEL = {};
+STAGE_ORDER.forEach(function(s){ STAGE_LABEL[s.kind] = s.label; });
+
+/* 某个阶段没有成绩时，要说清是哪种"没有"。
+   以前一律显示「本站无此阶段数据」，结果新加坡站（周六周日才跑）
+   看起来像数据源坏了。四种情况分开：
+     none    本站根本没有这个阶段（传统赛制没有冲刺）
+     future  还没开始
+     live    正在进行
+     pending 已经结束，成绩还在同步
+     nosrc   备用数据源不提供这个阶段的成绩 */
+function emptyStateFor(r, kind){
+  const label = STAGE_LABEL[kind] || kind;
+  const iso = r && r.times ? r.times[kind] : null;
+
+  if(!iso) return { cls: "none", text: "本站没有" + label + "（传统赛制周末）" };
+
+  const s = new Date(iso).getTime();
+  if(isNaN(s)) return { cls: "none", text: "本站没有" + label };
+
+  const e = (typeof sessionEndMs === "function" ? sessionEndMs(r, kind) : null) || (s + 3600000);
+  const now = Date.now();
+
+  if(now < s)  return { cls: "future",  text: "尚未开始 · " + fmtSession(iso) };
+  if(now < e)  return { cls: "live",    text: "正在进行中 · " + fmtSession(iso) };
+  if(kind === "sprintq" && S.source === "jolpica")
+    return { cls: "pending", text: "已结束 · 备用数据源不提供冲刺排位成绩" };
+  return { cls: "pending", text: "已结束，成绩同步中 · 通常赛后几分钟到几小时" };
+}
+
+function sessionTable(rows, kind, meetingKey, race){
+  if(!rows || !rows.length){
+    const st = emptyStateFor(race, kind);
+    return '<div class="card"><div class="msg ' + st.cls + '">' + esc(st.text) + '</div></div>';
+  }
   const isRace = kind === "race" || kind === "sprint";
 
   const head = `<tr>
@@ -1988,6 +2043,29 @@ function renderResultsList(){
   });
 }
 
+/* 一个比赛周末显示哪几个阶段，取决于这个周末实际有哪些阶段 ——
+   不能看「有没有成绩」，否则还没开跑的冲刺赛会整块消失（新加坡站就是这样）。
+   传统赛制周末只有排位赛和正赛，冲刺排位/冲刺赛不会出现。 */
+function stageBlocks(r, round, mk){
+  const bucketOf = function(k){
+    if(k === "race")   return S.results;
+    if(k === "quali")  return S.quali;
+    if(k === "sprint") return S.sprint;
+    return S.sprintq;
+  };
+  return STAGE_ORDER
+    .filter(function(st){ return r.times && r.times[st.kind]; })
+    .map(function(st){
+      const bucket = bucketOf(st.kind) || {};
+      return '<div class="sess">' +
+        '<div class="sess-h"><span class="ln" style="background:' + st.colour + '"></span>' +
+          esc(st.label) + ' ' + esc(st.en) +
+          '<span class="muted">' + esc(fmtSession(r.times[st.kind])) + '</span></div>' +
+        sessionTable(bucket[round], st.kind, mk, r) +
+      '</div>';
+    }).join("");
+}
+
 function showRound(round){
   const r = S.races.find(x => x.round === round);
   if(!r) return;
@@ -2006,21 +2084,7 @@ function showRound(round){
       </div>
       <div style="padding:10px 18px 12px">${sessionLines(r)}</div>
     </div>
-    <div class="sess">
-      <div class="sess-h"><span class="ln"></span>排位赛 Qualifying
-        <span class="muted">${esc(fmtSession(r.times.quali))}</span></div>
-      ${sessionTable(S.quali[round], "quali", mk)}
-    </div>
-    ${S.sprint[round] ? `<div class="sess">
-      <div class="sess-h"><span class="ln" style="background:var(--gold)"></span>冲刺赛 Sprint
-        <span class="muted">${esc(fmtSession(r.times.sprint))}</span></div>
-      ${sessionTable(S.sprint[round], "sprint", mk)}
-    </div>` : ""}
-    <div class="sess">
-      <div class="sess-h"><span class="ln" style="background:var(--green)"></span>正赛 Grand Prix
-        <span class="muted">${esc(fmtSession(r.times.race))}</span></div>
-      ${sessionTable(S.results[round], "race", mk)}
-    </div>`;
+    ${stageBlocks(r, round, mk)}`;
 
   $("#backBtn").onclick = () => {
     d.classList.add("hide");
@@ -2071,7 +2135,7 @@ async function setYear(y){
 
   // 只重置数据字段，不动 S 的结构
   S.races = []; S.drivers = {};
-  S.results = {}; S.quali = {}; S.sprint = {};
+  S.results = {}; S.quali = {}; S.sprint = {}; S.sprintq = {};
   S.ds = []; S.cs = []; S.failed = [];
   S.loaded = false; S.source = null;
   S.standingsRound = null; S.standingsMeeting = null;
